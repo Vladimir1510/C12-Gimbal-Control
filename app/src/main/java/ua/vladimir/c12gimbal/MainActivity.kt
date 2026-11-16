@@ -19,7 +19,7 @@ class MainActivity : Activity() {
             setPadding(28, 36, 28, 24)
         }
 
-        fun addText(value: String, size: Float, bold: Boolean = false) {
+        fun addText(value: String, size: Float = 16f, bold: Boolean = false) {
             val item = TextView(this).apply {
                 text = value
                 textSize = size
