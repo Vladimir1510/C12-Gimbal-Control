@@ -10,12 +10,17 @@ import android.widget.TextView
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.TimeUnit
 
 class MainActivity : Activity() {
 
-    private lateinit var status: TextView
+    private lateinit var uartStatus: TextView
+    private lateinit var networkStatus: TextView
+
     private val channelViews = ArrayList<TextView>()
+    private val importantViews = HashMap<Int, TextView>()
 
     @Volatile
     private var running = false
@@ -82,22 +87,36 @@ class MainActivity : Activity() {
             return view
         }
 
-        addText("C12 Gimbal Control", 24f, true)
-        addText("Версія 0.8.0", 16f)
-        addText("КАНАЛИ ПУЛЬТА SIYI", 19f, true)
+        addText("C12 Gimbal Control", 25f, true)
+        addText("Версія 0.9.0", 16f)
 
-        status = addText(
-            "Підключення до UART...",
-            15f,
+        addText("СТАН ПІДКЛЮЧЕННЯ", 19f, true)
+
+        uartStatus = addText(
+            "UART: підключення...",
+            16f,
             true
         )
 
-        addText("CH1 — CH16", 17f, true)
+        networkStatus = addText(
+            "C12: перевірка мережі...",
+            16f,
+            true
+        )
+
+        addText("ОСНОВНІ КАНАЛИ КЕРУВАННЯ", 19f, true)
+
+        importantViews[6] = addText("CH6 — Нахил гімбала: ---", 20f, true)
+        importantViews[7] = addText("CH7 — Zoom: ---", 20f, true)
+        importantViews[12] = addText("CH12 — Стабілізація: ---", 20f, true)
+        importantViews[13] = addText("CH13 — Нахил вниз 90°: ---", 20f, true)
+
+        addText("УСІ КАНАЛИ SIYI", 19f, true)
 
         for (i in 1..16) {
             val view = addText(
                 "CH$i: ---",
-                17f,
+                16f,
                 i == 6 || i == 7 || i == 12 || i == 13
             )
 
@@ -108,7 +127,33 @@ class MainActivity : Activity() {
         scroll.addView(root)
         setContentView(scroll)
 
+        startNetworkCheck()
         startUart()
+    }
+
+    private fun startNetworkCheck() {
+        Thread {
+            try {
+                Socket().use { socket ->
+                    socket.connect(
+                        InetSocketAddress("192.168.144.108", 554),
+                        2500
+                    )
+                }
+
+                runOnUiThread {
+                    networkStatus.text =
+                        "C12: МЕРЕЖЕВИЙ ЗВ'ЯЗОК Є\n192.168.144.108:554 доступний"
+                }
+
+            } catch (e: Exception) {
+                runOnUiThread {
+                    networkStatus.text =
+                        "C12: НЕМАЄ TCP-З'ЄДНАННЯ\n" +
+                        "${e.javaClass.simpleName}: ${e.message}"
+                }
+            }
+        }.start()
     }
 
     private fun startUart() {
@@ -163,7 +208,7 @@ class MainActivity : Activity() {
                                     }
                                 }
                             } else {
-                                Thread.sleep(10)
+                                Thread.sleep(5)
                             }
 
                             while (buffer.size >= 8) {
@@ -255,14 +300,26 @@ class MainActivity : Activity() {
                                         lastUpdate = now
 
                                         runOnUiThread {
-                                            status.text =
-                                                "ЗВ'ЯЗОК Є | CRC OK\n" +
+                                            uartStatus.text =
+                                                "UART: ЗВ'ЯЗОК Є | CRC OK\n" +
                                                 "Коректних пакетів: $validPackets"
 
                                             for (i in 0 until 16) {
                                                 channelViews[i].text =
                                                     "CH${i + 1}: ${channels[i]}"
                                             }
+
+                                            importantViews[6]?.text =
+                                                "CH6 — Нахил гімбала: ${channels[5]}"
+
+                                            importantViews[7]?.text =
+                                                "CH7 — Zoom: ${channels[6]}"
+
+                                            importantViews[12]?.text =
+                                                "CH12 — Стабілізація: ${channels[11]}"
+
+                                            importantViews[13]?.text =
+                                                "CH13 — Нахил вниз 90°: ${channels[12]}"
                                         }
                                     }
                                 }
@@ -281,8 +338,9 @@ class MainActivity : Activity() {
 
             } catch (e: Exception) {
                 runOnUiThread {
-                    status.text =
-                        "ПОМИЛКА UART:\n${e.javaClass.simpleName}\n${e.message}"
+                    uartStatus.text =
+                        "ПОМИЛКА UART:\n" +
+                        "${e.javaClass.simpleName}\n${e.message}"
                 }
             }
 
