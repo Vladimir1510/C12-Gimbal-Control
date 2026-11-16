@@ -2,12 +2,12 @@ package ua.vladimir.c12gimbal
 
 import android.app.Activity
 import android.os.Bundle
-import android.os.Process
 import android.graphics.Typeface
 import android.view.Gravity
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.io.File
+import java.io.FileInputStream
 
 class MainActivity : Activity() {
 
@@ -31,31 +31,36 @@ class MainActivity : Activity() {
             root.addView(item)
         }
 
+        addText("C12 Gimbal Control", 26f, true)
+        addText("UART TEST 0.3.0", 18f, true)
+
         val port = File("/dev/ttyHS3")
 
-        addText("C12 Gimbal Control", 26f, true)
-        addText("UART TEST 0.2.0", 18f, true)
+        addText("ПЕРЕВІРКА ПОРТУ", 19f, true)
+        addText("Пристрій існує: ${port.exists()}")
+        addText("Доступ для читання: ${port.canRead()}")
 
-        addText("ПАРАМЕТРИ ПУЛЬТА", 19f, true)
-        addText("Android: 13")
-        addText("SDK: UART")
-        addText("Очікувана швидкість: 115200 бод")
+        var input: FileInputStream? = null
+        var result: String
 
-        addText("ПЕРЕВІРКА UART", 19f, true)
-        addText("Порт: /dev/ttyHS3")
-        addText("Існує: ${port.exists()}")
-        addText("Це файл: ${port.isFile}")
-        addText("Доступний для читання: ${port.canRead()}")
-        addText("Доступний для запису: ${port.canWrite()}")
-        addText("UID програми: ${Process.myUid()}")
+        try {
+            input = FileInputStream(port)
+            result = "ПОРТ ВІДКРИТО ДЛЯ ЧИТАННЯ"
+        } catch (e: Exception) {
+            result = "ПОМИЛКА ВІДКРИТТЯ:\n${e.javaClass.simpleName}: ${e.message}"
+        } finally {
+            try {
+                input?.close()
+            } catch (_: Exception) {
+            }
+        }
+
+        addText("РЕЗУЛЬТАТ", 19f, true)
+        addText(result, 17f, true)
 
         addText(
-            "УВАГА", 19f, true
-        )
-        addText(
-            "Це попередня перевірка прав доступу. " +
-            "UART не відкривається, дані не читаються " +
-            "і команди не передаються."
+            "Дані не читаються і не передаються. " +
+            "Порт відкривається лише для короткої перевірки."
         )
 
         setContentView(root)
