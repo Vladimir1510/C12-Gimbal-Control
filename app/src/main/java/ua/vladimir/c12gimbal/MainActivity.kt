@@ -1,12 +1,13 @@
-
 package ua.vladimir.c12gimbal
 
 import android.app.Activity
 import android.os.Bundle
+import android.os.Process
 import android.graphics.Typeface
 import android.view.Gravity
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.io.File
 
 class MainActivity : Activity() {
 
@@ -30,22 +31,31 @@ class MainActivity : Activity() {
             root.addView(item)
         }
 
+        val port = File("/dev/ttyHS3")
+
         addText("C12 Gimbal Control", 26f, true)
-        addText("Версія 0.1.0", 15f)
-        addText("КАНАЛИ КЕРУВАННЯ", 19f, true)
+        addText("UART TEST 0.2.0", 18f, true)
 
-        addText("CH10 — ZOOM", 18f, true)
-        addText("CH11 — PITCH", 18f, true)
-        addText("CH12 — CENTER", 18f, true)
-        addText("CH13 — DOWN 90°", 18f, true)
+        addText("ПАРАМЕТРИ ПУЛЬТА", 19f, true)
+        addText("Android: 13")
+        addText("SDK: UART")
+        addText("Очікувана швидкість: 115200 бод")
 
-        addText("СТАН СИСТЕМИ", 19f, true)
-        addText("Камера: очікує перевірки")
-        addText("Пульт: очікує підключення")
+        addText("ПЕРЕВІРКА UART", 19f, true)
+        addText("Порт: /dev/ttyHS3")
+        addText("Існує: ${port.exists()}")
+        addText("Це файл: ${port.isFile}")
+        addText("Доступний для читання: ${port.canRead()}")
+        addText("Доступний для запису: ${port.canWrite()}")
+        addText("UID програми: ${Process.myUid()}")
 
         addText(
-            "Безпечний тестовий режим. " +
-            "Команди руху поки не передаються."
+            "УВАГА", 19f, true
+        )
+        addText(
+            "Це попередня перевірка прав доступу. " +
+            "UART не відкривається, дані не читаються " +
+            "і команди не передаються."
         )
 
         setContentView(root)
