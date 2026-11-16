@@ -31,39 +31,47 @@ class MainActivity : Activity() {
         }
 
         addText("C12 Gimbal Control", 26f, true)
-        addText("UART TEST 0.4.0", 18f, true)
+        addText("UART TEST 0.5.0", 18f, true)
+        addText("ПЕРЕВІРКА STTY", 19f, true)
 
-        addText("ПЕРЕВІРКА СИСТЕМИ", 19f, true)
-
-        val sttyPaths = listOf(
+        val paths = listOf(
             "/system/bin/stty",
             "/vendor/bin/stty",
             "/bin/stty"
         )
 
-        var found = false
-
-        for (path in sttyPaths) {
+        for (path in paths) {
             val file = File(path)
-            addText("$path : ${file.exists()}")
-            if (file.exists()) found = true
+            addText("$path")
+            addText("Існує: ${file.exists()}")
+            addText("Можна запускати: ${file.canExecute()}")
         }
 
-        addText("РЕЗУЛЬТАТ", 19f, true)
+        addText("ТЕСТ ЗАПУСКУ", 19f, true)
+
+        try {
+            val process = ProcessBuilder(
+                "/system/bin/stty",
+                "--help"
+            ).redirectErrorStream(true).start()
+
+            val output = process.inputStream
+                .bufferedReader()
+                .use { it.readText() }
+
+            val exitCode = process.waitFor()
+
+            addText("Код завершення: $exitCode")
+            addText(output.take(1200))
+
+        } catch (e: Exception) {
+            addText("ПОМИЛКА ЗАПУСКУ", 19f, true)
+            addText("${e.javaClass.simpleName}: ${e.message}")
+        }
 
         addText(
-            if (found) {
-                "Знайдено stty. Потрібно перевірити права доступу."
-            } else {
-                "stty у стандартних місцях не знайдено."
-            },
-            17f,
-            true
-        )
-
-        addText(
-            "UART не відкривається і не змінюється. " +
-            "Команди не передаються."
+            "UART не відкривається. " +
+            "Жодних команд пульту або камері не передано."
         )
 
         setContentView(root)
