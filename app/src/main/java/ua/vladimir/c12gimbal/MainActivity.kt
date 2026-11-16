@@ -10,20 +10,34 @@ import android.widget.TextView
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 class MainActivity : Activity() {
 
     private lateinit var uartStatus: TextView
     private lateinit var networkStatus: TextView
+    private lateinit var udpStatus: TextView
 
     private val channelViews = ArrayList<TextView>()
     private val importantViews = HashMap<Int, TextView>()
 
     @Volatile
     private var running = false
+
+    @Volatile
+    private var latestChannels = IntArray(16)
+
+    @Volatile
+    private var lastRcPacketMs = 0L
+
+    private val cameraIp = "192.168.144.108"
+    private val cameraPort = 5000
 
     private fun crc16(data: ByteArray, length: Int): Int {
         var crc = 0
@@ -57,6 +71,76 @@ class MainActivity : Activity() {
         )
     }
 
+    // Контрольна сума протоколу C12:
+    // сума ASCII-байтів modulo 256.
+    private fun makeCameraFrame(
+        address: Char,
+        command: String,
+        data: String
+    ): ByteArray {
+
+        val body = "#TPU${address}${data.length.toString(16).uppercase()}w${command}${data}"
+
+        val checksum = body
+            .toByteArray(Charsets.US_ASCII)
+            .sumOf { it.toInt() and 0xFF } and 0xFF
+
+        val frame = body + "%02X".format(checksum)
+
+        return frame.toByteArray(Charsets.US_ASCII)
+    }
+
+    private fun sendCameraCommand(
+        socket: DatagramSocket,
+        address: Char,
+        command: String,
+        data: String
+    ) {
+        val bytes = makeCameraFrame(address, command, data)
+
+        val packet = DatagramPacket(
+            bytes,
+            bytes.size,
+            InetAddress.getByName(cameraIp),
+            cameraPort
+        )
+
+        socket.send(packet)
+    }
+
+    private fun sendPitchSpeed(
+        socket: DatagramSocket,
+        speed: Int
+    ) {
+        val limited = speed.coerceIn(-99, 99)
+
+        val encoded = if (limited < 0) {
+            256 + limited
+        } else {
+            limited
+        }
+
+        val data = "%02X".format(encoded)
+
+        sendCameraCommand(socket, 'G', "GSP", data)
+    }
+
+    private fun sendCenter(socket: DatagramSocket) {
+        sendCameraCommand(socket, 'G', "PTZ", "05")
+    }
+
+    private fun sendDown(socket: DatagramSocket) {
+        sendCameraCommand(socket, 'G', "PTZ", "02")
+    }
+
+    private fun sendZoomIn(socket: DatagramSocket) {
+        sendCameraCommand(socket, 'D', "DZM", "0A")
+    }
+
+    private fun sendZoomOut(socket: DatagramSocket) {
+        sendCameraCommand(socket, 'D', "DZM", "0B")
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -88,7 +172,7 @@ class MainActivity : Activity() {
         }
 
         addText("C12 Gimbal Control", 25f, true)
-        addText("Версія 0.9.0", 16f)
+        addText("Версія 1.0.0", 16f)
 
         addText("СТАН ПІДКЛЮЧЕННЯ", 19f, true)
 
@@ -104,12 +188,25 @@ class MainActivity : Activity() {
             true
         )
 
+        udpStatus = addText(
+            "UDP C12: очікування...",
+            16f,
+            true
+        )
+
         addText("ОСНОВНІ КАНАЛИ КЕРУВАННЯ", 19f, true)
 
-        importantViews[6] = addText("CH6 — Нахил гімбала: ---", 20f, true)
-        importantViews[7] = addText("CH7 — Zoom: ---", 20f, true)
-        importantViews[12] = addText("CH12 — Стабілізація: ---", 20f, true)
-        importantViews[13] = addText("CH13 — Нахил вниз 90°: ---", 20f, true)
+        importantViews[6] =
+            addText("CH6 — Нахил гімбала: ---", 20f, true)
+
+        importantViews[7] =
+            addText("CH7 — Zoom: ---", 20f, true)
+
+        importantViews[12] =
+            addText("CH12 — Центрування: ---", 20f, true)
+
+        importantViews[13] =
+            addText("CH13 — Нахил вниз: ---", 20f, true)
 
         addText("УСІ КАНАЛИ SIYI", 19f, true)
 
@@ -127,8 +224,11 @@ class MainActivity : Activity() {
         scroll.addView(root)
         setContentView(scroll)
 
+        running = true
+
         startNetworkCheck()
         startUart()
+        startCameraControl()
     }
 
     private fun startNetworkCheck() {
@@ -136,14 +236,14 @@ class MainActivity : Activity() {
             try {
                 Socket().use { socket ->
                     socket.connect(
-                        InetSocketAddress("192.168.144.108", 554),
+                        InetSocketAddress(cameraIp, 554),
                         2500
                     )
                 }
 
                 runOnUiThread {
                     networkStatus.text =
-                        "C12: МЕРЕЖЕВИЙ ЗВ'ЯЗОК Є\n192.168.144.108:554 доступний"
+                        "C12: TCP ВІДКРИТИЙ\n$cameraIp:554 доступний"
                 }
 
             } catch (e: Exception) {
@@ -157,8 +257,6 @@ class MainActivity : Activity() {
     }
 
     private fun startUart() {
-        running = true
-
         Thread {
             try {
                 val config = ProcessBuilder(
@@ -292,6 +390,9 @@ class MainActivity : Activity() {
                                             ((packet[position + 1].toInt() and 0xFF) shl 8)
                                     }
 
+                                    latestChannels = channels
+                                    lastRcPacketMs = System.currentTimeMillis()
+
                                     validPackets++
 
                                     val now = System.currentTimeMillis()
@@ -300,6 +401,8 @@ class MainActivity : Activity() {
                                         lastUpdate = now
 
                                         runOnUiThread {
+                                            if (!running) return@runOnUiThread
+
                                             uartStatus.text =
                                                 "UART: ЗВ'ЯЗОК Є | CRC OK\n" +
                                                 "Коректних пакетів: $validPackets"
@@ -316,10 +419,10 @@ class MainActivity : Activity() {
                                                 "CH7 — Zoom: ${channels[6]}"
 
                                             importantViews[12]?.text =
-                                                "CH12 — Стабілізація: ${channels[11]}"
+                                                "CH12 — Центрування: ${channels[11]}"
 
                                             importantViews[13]?.text =
-                                                "CH13 — Нахил вниз 90°: ${channels[12]}"
+                                                "CH13 — Нахил вниз: ${channels[12]}"
                                         }
                                     }
                                 }
@@ -337,10 +440,167 @@ class MainActivity : Activity() {
                 }
 
             } catch (e: Exception) {
+                if (running) {
+                    runOnUiThread {
+                        uartStatus.text =
+                            "ПОМИЛКА UART:\n" +
+                            "${e.javaClass.simpleName}\n${e.message}"
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun startCameraControl() {
+        Thread {
+            var socket: DatagramSocket? = null
+
+            try {
+                // Локальний UDP-порт 5000.
+                socket = DatagramSocket(cameraPort)
+                socket.soTimeout = 100
+
                 runOnUiThread {
-                    uartStatus.text =
-                        "ПОМИЛКА UART:\n" +
-                        "${e.javaClass.simpleName}\n${e.message}"
+                    udpStatus.text =
+                        "UDP: локальний порт 5000 відкритий\n" +
+                        "Камера: $cameraIp:$cameraPort\n" +
+                        "Відповідь камери ще не підтверджена"
+                }
+
+                var lastPitchSpeed = 0
+                var lastZoomTime = 0L
+
+                var centerPressed = false
+                var downPressed = false
+
+                var lastStaleStop = false
+
+                while (running) {
+
+                    val now = System.currentTimeMillis()
+                    val channels = latestChannels
+                    val rcFresh =
+                        now - lastRcPacketMs < 500 &&
+                        lastRcPacketMs > 0
+
+                    if (!rcFresh) {
+
+                        if (lastPitchSpeed != 0) {
+                            sendPitchSpeed(socket, 0)
+                            lastPitchSpeed = 0
+                        }
+
+                        if (!lastStaleStop) {
+                            runOnUiThread {
+                                udpStatus.text =
+                                    "UDP: очікування сигналу пульта\n" +
+                                    "Рух камери заблоковано"
+                            }
+
+                            lastStaleStop = true
+                        }
+
+                        Thread.sleep(100)
+                        continue
+                    }
+
+                    lastStaleStop = false
+
+                    // CH6: плавний нахил камери.
+                    // Центр 1500, максимум приблизно 2 градуси/с.
+                    val pitchPwm = channels[5]
+                    val pitchDifference = pitchPwm - 1500
+
+                    val pitchSpeed = if (abs(pitchDifference) <= 30) {
+                        0
+                    } else {
+                        (pitchDifference * 20 / 450).coerceIn(-20, 20)
+                    }
+
+                    if (
+                        pitchSpeed != 0 ||
+                        lastPitchSpeed != 0
+                    ) {
+                        sendPitchSpeed(socket, pitchSpeed)
+                        lastPitchSpeed = pitchSpeed
+                    }
+
+                    // CH7: дискретне наближення/віддалення.
+                    // Один крок приблизно кожні 350 мс.
+                    val zoomPwm = channels[6]
+
+                    if (now - lastZoomTime >= 350) {
+
+                        when {
+                            zoomPwm > 1600 -> {
+                                sendZoomIn(socket)
+                                lastZoomTime = now
+                            }
+
+                            zoomPwm < 1400 -> {
+                                sendZoomOut(socket)
+                                lastZoomTime = now
+                            }
+                        }
+                    }
+
+                    // CH12: повернення камери в центр.
+                    // Команда відправляється один раз при натисканні.
+                    val centerNow = channels[11] > 1700
+
+                    if (centerNow && !centerPressed) {
+                        sendPitchSpeed(socket, 0)
+                        lastPitchSpeed = 0
+
+                        sendCenter(socket)
+
+                        runOnUiThread {
+                            udpStatus.text =
+                                "UDP: надіслана команда центрування CH12"
+                        }
+                    }
+
+                    centerPressed = centerNow
+
+                    // CH13: команда нахилу вниз.
+                    // Один раз на натискання, без повторення.
+                    val downNow = channels[12] > 1700
+
+                    if (downNow && !downPressed) {
+                        sendPitchSpeed(socket, 0)
+                        lastPitchSpeed = 0
+
+                        sendDown(socket)
+
+                        runOnUiThread {
+                            udpStatus.text =
+                                "UDP: надіслана команда нахилу вниз CH13"
+                        }
+                    }
+
+                    downPressed = downNow
+
+                    Thread.sleep(100)
+                }
+
+            } catch (e: Exception) {
+                if (running) {
+                    runOnUiThread {
+                        udpStatus.text =
+                            "ПОМИЛКА UDP:\n" +
+                            "${e.javaClass.simpleName}\n${e.message}"
+                    }
+                }
+
+            } finally {
+                try {
+                    socket?.let {
+                        if (!it.isClosed) {
+                            sendPitchSpeed(it, 0)
+                            it.close()
+                        }
+                    }
+                } catch (_: Exception) {
                 }
             }
 
