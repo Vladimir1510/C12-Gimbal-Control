@@ -7,7 +7,6 @@ import android.view.Gravity
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.io.File
-import java.io.FileInputStream
 
 class MainActivity : Activity() {
 
@@ -32,35 +31,39 @@ class MainActivity : Activity() {
         }
 
         addText("C12 Gimbal Control", 26f, true)
-        addText("UART TEST 0.3.0", 18f, true)
+        addText("UART TEST 0.4.0", 18f, true)
 
-        val port = File("/dev/ttyHS3")
+        addText("ПЕРЕВІРКА СИСТЕМИ", 19f, true)
 
-        addText("ПЕРЕВІРКА ПОРТУ", 19f, true)
-        addText("Пристрій існує: ${port.exists()}")
-        addText("Доступ для читання: ${port.canRead()}")
+        val sttyPaths = listOf(
+            "/system/bin/stty",
+            "/vendor/bin/stty",
+            "/bin/stty"
+        )
 
-        var input: FileInputStream? = null
-        var result: String
+        var found = false
 
-        try {
-            input = FileInputStream(port)
-            result = "ПОРТ ВІДКРИТО ДЛЯ ЧИТАННЯ"
-        } catch (e: Exception) {
-            result = "ПОМИЛКА ВІДКРИТТЯ:\n${e.javaClass.simpleName}: ${e.message}"
-        } finally {
-            try {
-                input?.close()
-            } catch (_: Exception) {
-            }
+        for (path in sttyPaths) {
+            val file = File(path)
+            addText("$path : ${file.exists()}")
+            if (file.exists()) found = true
         }
 
         addText("РЕЗУЛЬТАТ", 19f, true)
-        addText(result, 17f, true)
 
         addText(
-            "Дані не читаються і не передаються. " +
-            "Порт відкривається лише для короткої перевірки."
+            if (found) {
+                "Знайдено stty. Потрібно перевірити права доступу."
+            } else {
+                "stty у стандартних місцях не знайдено."
+            },
+            17f,
+            true
+        )
+
+        addText(
+            "UART не відкривається і не змінюється. " +
+            "Команди не передаються."
         )
 
         setContentView(root)
