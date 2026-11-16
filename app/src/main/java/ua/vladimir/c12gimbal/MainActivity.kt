@@ -39,9 +39,9 @@ class MainActivity : Activity() {
         val port = File("/dev/ttyHS3")
 
         addText("ПРИСТРІЙ: /dev/ttyHS3", 16f, true)
-        addText("Існує: ${port.exists()}")
-        addText("Читання: ${port.canRead()}")
-        addText("Запис: ${port.canWrite()}")
+        addText("Існує: ${port.exists()}", 16f)
+        addText("Читання: ${port.canRead()}", 16f)
+        addText("Запис: ${port.canWrite()}", 16f)
 
         val result = addText(
             "Перевірка параметрів UART...\nЗачекай кілька секунд.",
