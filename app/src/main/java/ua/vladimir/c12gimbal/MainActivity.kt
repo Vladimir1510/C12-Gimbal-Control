@@ -200,7 +200,7 @@ class MainActivity : Activity() {
         }
 
         val scroll = ScrollView(this).apply {
-            fillViewport = true
+            isFillViewport = true
             setBackgroundColor(pageColor)
             addView(rootLayout)
         }
