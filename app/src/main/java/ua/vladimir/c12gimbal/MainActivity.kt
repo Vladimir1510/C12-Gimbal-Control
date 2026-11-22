@@ -1,123 +1,96 @@
-        }.start()
-    }
+package ua.vladimir.c12gimbal
 
-    private fun startCameraControl() {
-        Thread {
-            var socket: DatagramSocket? = null
-            try {
-                socket = DatagramSocket(cameraPort)
-                socket.soTimeout = 100
+import android.app.Activity
+import android.os.Bundle
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
+import android.view.View
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
-                runOnUiThread {
-                    udpStatus.text = "●  UDP C12: локальний порт 5000 відкритий; камера $cameraIp:5000"
-                    udpStatus.setTextColor(accentColor)
-                }
+class MainActivity : Activity() {
 
-                var lastPitchSpeed = 0
-                var lastZoomTime = 0L
-                var centerPressed = false
-                var downPressed = false
-                var lastStaleStop = false
+    private lateinit var uartStatus: TextView
+    private lateinit var networkStatus: TextView
+    private lateinit var udpStatus: TextView
+    private lateinit var rootLayout: LinearLayout
 
-                while (running) {
-                    val now = System.currentTimeMillis()
-                    val channels = latestChannels
-                    val rcFresh = now - lastRcPacketMs < 500 && lastRcPacketMs > 0
+    private val channelViews = ArrayList<TextView>()
+    private val importantViews = HashMap<Int, TextView>()
 
-                    if (!rcFresh) {
-                        if (lastPitchSpeed != 0) {
-                            sendPitchSpeed(socket, 0)
-                            lastPitchSpeed = 0
-                        }
-                        if (!lastStaleStop) {
-                            runOnUiThread {
-                                udpStatus.text = "●  UDP C12: очікування сигналу пульта — рух зупинено"
-                                udpStatus.setTextColor(warningColor)
-                            }
-                            lastStaleStop = true
-                        }
-                        Thread.sleep(100)
-                        continue
-                    }
-                    lastStaleStop = false
+    @Volatile
+    private var running = false
 
-                    // CH6 PITCH: швидкість збільшена вдвічі.
-                    // Було ±20, стало ±40; за шкалою GSP це приблизно до 4°/с.
-                    val pitchDifference = channels[5] - 1500
-                    val pitchSpeed = if (abs(pitchDifference) <= 30) {
-                        0
-                    } else {
-                        (pitchDifference * 40 / 450).coerceIn(-40, 40)
-                    }
+    @Volatile
+    private var latestChannels = IntArray(16)
 
-                    if (pitchSpeed != 0 || lastPitchSpeed != 0) {
-                        sendPitchSpeed(socket, pitchSpeed)
-                        lastPitchSpeed = pitchSpeed
-                    }
+    @Volatile
+    private var lastRcPacketMs = 0L
 
-                    // CH7 ZOOM: інтервал між кроками зменшений удвічі: 350 -> 175 мс.
-                    val zoomPwm = channels[6]
-                    if (now - lastZoomTime >= 175) {
-                        when {
-                            zoomPwm > 1600 -> {
-                                sendZoomIn(socket)
-                                lastZoomTime = now
-                            }
-                            zoomPwm < 1400 -> {
-                                sendZoomOut(socket)
-                                lastZoomTime = now
-                            }
-                        }
-                    }
+    private val cameraIp = "192.168.144.108"
+    private val cameraPort = 5000
 
-                    val centerNow = channels[11] > 1700
-                    if (centerNow && !centerPressed) {
-                        sendPitchSpeed(socket, 0)
-                        lastPitchSpeed = 0
-                        sendCenter(socket)
-                        runOnUiThread {
-                            udpStatus.text = "●  UDP C12: команда центрування CH12 надіслана"
-                            udpStatus.setTextColor(accentColor)
-                        }
-                    }
-                    centerPressed = centerNow
+    private val pageColor = Color.rgb(12, 19, 32)
+    private val cardColor = Color.rgb(24, 34, 51)
+    private val primaryColor = Color.rgb(239, 245, 252)
+    private val secondaryColor = Color.rgb(151, 169, 191)
+    private val accentColor = Color.rgb(46, 213, 180)
+    private val warningColor = Color.rgb(255, 190, 92)
 
-                    val downNow = channels[12] > 1700
-                    if (downNow && !downPressed) {
-                        sendPitchSpeed(socket, 0)
-                        lastPitchSpeed = 0
-                        sendDown(socket)
-                        runOnUiThread {
-                            udpStatus.text = "●  UDP C12: команда нахилу вниз CH13 надіслана"
-                            udpStatus.setTextColor(accentColor)
-                        }
-                    }
-                    downPressed = downNow
-                    Thread.sleep(100)
-                }
-            } catch (e: Exception) {
-                if (running) {
-                    runOnUiThread {
-                        udpStatus.text = "●  ПОМИЛКА UDP: ${e.javaClass.simpleName} — ${e.message}"
-                        udpStatus.setTextColor(warningColor)
-                    }
-                }
-            } finally {
-                try {
-                    socket?.let {
-                        if (!it.isClosed) {
-                            sendPitchSpeed(it, 0)
-                            it.close()
-                        }
-                    }
-                } catch (_: Exception) {
-                }
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
+
+    private fun roundedBackground(
+        color: Int,
+        radiusDp: Int = 18,
+        strokeColor: Int? = null
+    ): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = dp(radiusDp).toFloat()
+            if (strokeColor != null) {
+                setStroke(dp(1), strokeColor)
             }
-        }.start()
+        }
     }
 
-    override fun onDestroy() {
-        running = false
-        super.onDestroy()
+    private fun makeText(
+        value: String,
+        size: Float,
+        color: Int = primaryColor,
+        bold: Boolean = false
+    ): TextView {
+        return TextView(this).apply {
+            text = value
+            textSize = size
+            setTextColor(color)
+            includeFontPadding = false
+            if (bold) setTypeface(typeface, Typeface.BOLD)
+        }
     }
-}
+
+    private fun addCard(title: String): LinearLayout {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(15), dp(16), dp(15))
+            background = roundedBackground(cardColor)
+        }
+
+        val heading = makeText(title, 14f, accentColor, true)
+        heading.letterSpacing = 0.06f
+        card.addView(heading)
+
+        val params = LinearLayout.LayoutParams(
