@@ -1,15 +1,22 @@
 package ua.vladimir.c12gimbal
 
 import android.app.Activity
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.hardware.input.InputManager
+import android.os.Binder
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
+import android.os.Parcel
+import android.util.Log
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -40,6 +47,49 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
     // Last logged value per (deviceId, axis), so only changes are logged.
     private val lastAxisValues = HashMap<Long, Float>()
+
+    // UniGCS RemoteControlService probe: binder of the service, our callback and per-channel last values.
+    private var rcService: IBinder? = null
+    private var rcBound = false
+    private val rcChannelValues = HashMap<String, Int>()
+    private val rcCallbackCounts = HashMap<Int, Int>()
+
+    /**
+     * Raw implementation of biz.siyi.pilot.rcuservice.callback.IRemoteCallback.
+     * Only listens: logs every incoming transaction code, decodes codes 7/8 as List<ChannelValue>.
+     * Runs on a binder thread, so results are posted to the main thread.
+     */
+    private val rcCallback = object : Binder() {
+        init { attachInterface(null, RC_CALLBACK_DESCRIPTOR) }
+
+        override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+            if (code < FIRST_CALL_TRANSACTION || code > LAST_CALL_TRANSACTION) return super.onTransact(code, data, reply, flags)
+            val decoded = try {
+                data.enforceInterface(RC_CALLBACK_DESCRIPTOR)
+                if (code == RC_CB_CHANNELS_A || code == RC_CB_CHANNELS_B) readChannelValues(data) else null
+            } catch (e: Exception) {
+                handler.post { logEvent("RC CALLBACK code=$code: помилка розбору ${e.message}") }
+                null
+            }
+            reply?.writeNoException()
+            handler.post { onRcCallback(code, decoded) }
+            return true
+        }
+    }
+
+    private val rcConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, service: IBinder) {
+            rcService = service
+            logEvent("RC SERVICE підключено: ${name.flattenToShortString()}; descriptor=${service.interfaceDescriptor}")
+            rcTransact(RC_TX_REGISTER_CALLBACK, "реєстрація колбека", withCallback = true)
+            rcTransact(RC_TX_START_CHANNELS, "запит потоку каналів (tx 40)", withCallback = false)
+        }
+
+        override fun onServiceDisconnected(name: ComponentName) {
+            rcService = null
+            logEvent("RC SERVICE відключився (процес UniGCS зупинено?)")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -81,6 +131,12 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         }
         root.addView(copy)
 
+        val rcProbe = Button(this).apply {
+            text = "Проба UniGCS: підписатися на канали"
+            setOnClickListener { if (rcBound) stopRcProbe() else startRcProbe() }
+        }
+        root.addView(rcProbe)
+
         output = TextView(this).apply {
             textSize = 12f
             typeface = android.graphics.Typeface.MONOSPACE
@@ -99,6 +155,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
     override fun onDestroy() {
         try { inputManager.unregisterInputDeviceListener(this) } catch (_: Exception) {}
+        stopRcProbe()
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
@@ -242,11 +299,96 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     override fun onInputDeviceRemoved(deviceId: Int) { logEvent("INPUT DEVICE REMOVED id=$deviceId"); runFullScan() }
     override fun onInputDeviceChanged(deviceId: Int) { logEvent("INPUT DEVICE CHANGED id=$deviceId"); runFullScan() }
 
+    private fun startRcProbe() {
+        rcChannelValues.clear()
+        rcCallbackCounts.clear()
+        val intent = Intent().setComponent(ComponentName(RC_PACKAGE, RC_SERVICE_CLASS))
+        rcBound = try {
+            bindService(intent, rcConnection, Context.BIND_AUTO_CREATE)
+        } catch (e: Exception) {
+            logEvent("RC PROBE: bindService помилка ${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
+        logEvent(if (rcBound) "RC PROBE: bindService OK, чекаю підключення… Рухай стіки/колеса." else "RC PROBE: bindService повернув false (сервіс недоступний)")
+        if (rcBound) handler.postDelayed(rcStatsTask, RC_STATS_INTERVAL_MS)
+    }
+
+    private fun stopRcProbe() {
+        if (!rcBound) return
+        handler.removeCallbacks(rcStatsTask)
+        rcTransact(RC_TX_STOP_CHANNELS, "зупинка потоку каналів (tx 41)", withCallback = false)
+        rcTransact(RC_TX_UNREGISTER_CALLBACK, "зняття колбека", withCallback = true)
+        try { unbindService(rcConnection) } catch (_: Exception) {}
+        rcBound = false
+        rcService = null
+        logEvent("RC PROBE зупинено")
+    }
+
+    // Transactions 1/2 of IRemoteControl take only our callback binder (register/unregister, nothing reaches the RC).
+    // 40/41 take no arguments: the service tells the RC MCU to start/stop reporting channels (module 16, cmd 1, byte 1/0).
+    private fun rcTransact(code: Int, what: String, withCallback: Boolean) {
+        val service = rcService ?: return
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        try {
+            data.writeInterfaceToken(RC_SERVICE_DESCRIPTOR)
+            if (withCallback) data.writeStrongBinder(rcCallback)
+            service.transact(code, data, reply, 0)
+            reply.readException()
+            logEvent("RC PROBE: $what OK")
+        } catch (e: Exception) {
+            logEvent("RC PROBE: $what помилка ${e.javaClass.simpleName}: ${e.message}")
+        } finally {
+            data.recycle()
+            reply.recycle()
+        }
+    }
+
+    // Parcel layout of List<biz.siyi.protocol.bu.rcu.ChannelValue>: size, then per item non-null flag, enum name, value.
+    private fun readChannelValues(data: Parcel): List<Pair<String, Int>> {
+        val size = data.readInt()
+        val result = ArrayList<Pair<String, Int>>()
+        for (i in 0 until size) {
+            if (data.readInt() == 0) continue
+            val channel = data.readString() ?: "?"
+            result.add(channel to data.readInt())
+        }
+        return result
+    }
+
+    private fun onRcCallback(code: Int, channels: List<Pair<String, Int>>?) {
+        val count = (rcCallbackCounts[code] ?: 0) + 1
+        rcCallbackCounts[code] = count
+        if (channels == null) {
+            if (count == 1) logEvent("RC CALLBACK code=$code (перший раз)")
+            return
+        }
+        val changed = StringBuilder()
+        for ((channel, value) in channels) {
+            val key = "$code/$channel"
+            val last = rcChannelValues[key]
+            if (last == null || kotlin.math.abs(value - last) > RC_CHANNEL_EPS) {
+                rcChannelValues[key] = value
+                changed.append(" ${channel.removePrefix("CHANNEL_").let { "CH$it" }}=$value")
+            }
+        }
+        if (changed.isNotEmpty()) logEvent("RC CHANNELS code=$code n=${channels.size}:$changed")
+    }
+
+    private val rcStatsTask = object : Runnable {
+        override fun run() {
+            val stats = rcCallbackCounts.entries.sortedBy { it.key }.joinToString(" ") { "${it.key}:${it.value}" }
+            logEvent("RC STATS (code:кількість) ${stats.ifEmpty { "колбеків ще не було" }}")
+            handler.postDelayed(this, RC_STATS_INTERVAL_MS)
+        }
+    }
+
     private fun report(line: String) {
         scanLog.append(line).append('\n')
     }
 
     private fun logEvent(line: String) {
+        Log.i(LOG_TAG, line)
         events.addLast("${timeFormat.format(Date())} $line")
         while (events.size > MAX_EVENT_LINES) events.removeFirst()
         scheduleRender()
@@ -269,5 +411,20 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     private companion object {
         const val MAX_EVENT_LINES = 500
         const val RENDER_INTERVAL_MS = 100L
+        const val LOG_TAG = "UniRcDiag"
+
+        // Taken from decompiled UniGCS (biz.siyi.remotecontrol): IRemoteControl / IRemoteCallback binder contract.
+        const val RC_PACKAGE = "biz.siyi.remotecontrol"
+        const val RC_SERVICE_CLASS = "biz.siyi.pilot.rcuservice.RemoteControlService"
+        const val RC_SERVICE_DESCRIPTOR = "biz.siyi.pilot.rcuservice.IRemoteControl"
+        const val RC_CALLBACK_DESCRIPTOR = "biz.siyi.pilot.rcuservice.callback.IRemoteCallback"
+        const val RC_TX_REGISTER_CALLBACK = 1
+        const val RC_TX_UNREGISTER_CALLBACK = 2
+        const val RC_TX_START_CHANNELS = 40
+        const val RC_TX_STOP_CHANNELS = 41
+        const val RC_CB_CHANNELS_A = 7
+        const val RC_CB_CHANNELS_B = 8
+        const val RC_CHANNEL_EPS = 3
+        const val RC_STATS_INTERVAL_MS = 5000L
     }
 }
