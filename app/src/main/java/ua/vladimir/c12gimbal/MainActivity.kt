@@ -745,8 +745,8 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         const val WHEEL_CENTER = 1500
         const val WHEEL_SPAN = 450
         const val WHEEL_DEADZONE = 45
-        const val MAX_PITCH_SPEED = 25
-        const val DOWN90_SPEED = 20
+        const val MAX_PITCH_SPEED = 50
+        const val DOWN90_SPEED = 30
         const val WATCHDOG_INTERVAL_MS = 200L
         const val STATUS_INTERVAL_MS = 1000L
         const val CAMERA_INTERFACE = "usb0"
@@ -763,6 +763,6 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         val COLOR_WARN = android.graphics.Color.parseColor("#F5B841")
         val COLOR_WARN_DIM = android.graphics.Color.parseColor("#3D3220")
         val COLOR_STOP = android.graphics.Color.parseColor("#B3261E")
-        const val ZOOM_STEP_MS = 175L
+        const val ZOOM_STEP_MS = 90L
     }
 }
