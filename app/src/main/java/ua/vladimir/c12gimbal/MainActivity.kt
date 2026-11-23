@@ -9,14 +9,11 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.hardware.input.InputManager
-import android.os.Binder
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.Parcel
-import android.util.Log
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -30,8 +27,8 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Read-only diagnostics for UniRC 7.
- * IMPORTANT: This Activity does not open UART, create UDP sockets, or send commands.
+ * Controller screen and diagnostics for UniRC 7 -> C12.
+ * The controller runs in GimbalService; this Activity only shows its state and the diagnostics log.
  */
 class MainActivity : Activity(), InputManager.InputDeviceListener {
     private lateinit var output: TextView
@@ -48,57 +45,28 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     // Last logged value per (deviceId, axis), so only changes are logged.
     private val lastAxisValues = HashMap<Long, Float>()
 
-    // UniGCS RemoteControlService probe: binder of the service, our callback and per-channel last values.
-    private var rcService: IBinder? = null
-    private var rcBound = false
-    private val rcChannelValues = HashMap<String, Int>()
-    private val rcCallbackCounts = HashMap<Int, Int>()
+    // The controller itself lives in GimbalService so it keeps running behind other apps.
+    private var gimbal: GimbalService? = null
 
-    // Gimbal controller: RC channels (via the probe above) -> C12 UDP commands.
-    private var c12: C12Client? = null
-    private var lastPitchSpeed = 0
-    private var zoomDirection = 0
-    private val buttonPressed = HashMap<String, Boolean>()
-
-    /**
-     * Raw implementation of biz.siyi.pilot.rcuservice.callback.IRemoteCallback.
-     * Only listens: logs every incoming transaction code, decodes codes 7/8 as List<ChannelValue>.
-     * Runs on a binder thread, so results are posted to the main thread.
-     */
-    private val rcCallback = object : Binder() {
-        init { attachInterface(null, RC_CALLBACK_DESCRIPTOR) }
-
-        override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
-            if (code < FIRST_CALL_TRANSACTION || code > LAST_CALL_TRANSACTION) return super.onTransact(code, data, reply, flags)
-            val decoded = try {
-                data.enforceInterface(RC_CALLBACK_DESCRIPTOR)
-                if (code == RC_CB_CHANNELS_A || code == RC_CB_CHANNELS_B) readChannelValues(data) else null
-            } catch (e: Exception) {
-                handler.post { logEvent("RC CALLBACK code=$code: помилка розбору ${e.message}") }
-                null
-            }
-            reply?.writeNoException()
-            handler.post { onRcCallback(code, decoded) }
-            return true
+    private val gimbalListener = object : GimbalService.Listener {
+        override fun onLog(line: String) = logEvent(line)
+        override fun onChannels(channels: Map<String, Int>) = updateLive(channels)
+        override fun onStateChanged() = refreshStatus()
+        override fun onCommand(what: String) {
+            if (::lastCommand.isInitialized) lastCommand.text = "Остання команда: $what  ·  ${timeFormat.format(Date())}"
         }
     }
 
-    private val rcConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName, service: IBinder) {
-            rcService = service
-            logEvent("RC SERVICE підключено: ${name.flattenToShortString()}; descriptor=${service.interfaceDescriptor}")
-            rcTransact(RC_TX_REGISTER_CALLBACK, "реєстрація колбека", withCallback = true)
-            rcTransact(RC_TX_START_CHANNELS, "запит потоку каналів (tx 40)", withCallback = false)
+    private val gimbalConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            gimbal = (binder as GimbalService.LocalBinder).service.also { it.listener = gimbalListener }
+            logEvent("Сервіс керування підключено")
+            refreshStatus()
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
-            rcService = null
-            channelsReceived = false
-            logEvent("RC SERVICE відключився (процес UniGCS зупинено?)")
-            if (c12 != null && lastPitchSpeed != 0) {
-                lastPitchSpeed = 0
-                sendC12(C12Protocol.stop(), "стоп (сервіс каналів відключився)")
-            }
+            gimbal = null
+            refreshStatus()
         }
     }
 
@@ -111,9 +79,19 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
         inputManager.registerInputDeviceListener(this, null)
         runFullScan()
-        // Subscribe to RC channels right away so the live indicators work; gimbal commands start only with the toggle.
-        startRcProbe()
+        // The service subscribes to RC channels right away; gimbal commands start only with the toggle.
+        val serviceIntent = Intent(this, GimbalService::class.java)
+        startForegroundService(serviceIntent)
+        bindService(serviceIntent, gimbalConnection, Context.BIND_AUTO_CREATE)
+        if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
         handler.post(statusTask)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Coming back from the overlay permission screen: show the floating button if it was just allowed.
+        if (android.provider.Settings.canDrawOverlays(this)) gimbal?.showOverlay()
+        refreshStatus()
     }
 
     // ---------- UI ----------
@@ -130,7 +108,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     private lateinit var lastCommand: TextView
     private lateinit var hint: TextView
     private lateinit var diagnostics: LinearLayout
-    private var channelsReceived = false
+    private lateinit var overlayButton: Button
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -182,11 +160,15 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         }
 
         toggleButton = bigButton("", COLOR_OK) {
-            if (c12 == null) startController() else stopController()
-            refreshStatus()
+            gimbal?.let { it.setControlActive(!it.controlActive) }
         }
-        centerButton = bigButton("⊙  Центр", COLOR_BUTTON) { manualCommand(C12Protocol.center(), "центр (екран)") }
-        downButton = bigButton("↓  Вниз 90°", COLOR_BUTTON) { manualCommand(C12Protocol.pitchAbsolute(-90, DOWN90_SPEED), "вниз 90° (екран)") }
+        centerButton = bigButton("⊙  Центр", COLOR_BUTTON) { gimbal?.manualCommand(C12Protocol.center(), "центр (екран)") }
+        downButton = bigButton("↓  Вниз 90°", COLOR_BUTTON) {
+            gimbal?.manualCommand(C12Protocol.pitchAbsolute(-90, GimbalService.DOWN90_SPEED), "вниз 90° (екран)")
+        }
+        overlayButton = bigButton("Дозволити кнопку поверх усіх додатків", COLOR_BUTTON) {
+            startActivity(Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName")))
+        }.apply { textSize = 15f }
         val quickRow = LinearLayout(this).apply {
             addView(spaced(centerButton, 0, 1f, height = dp(64)))
             addView(spaced(downButton, 0, 1f, height = dp(64)).apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(10) })
@@ -202,6 +184,8 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         val legend = card(
             label("Керування з пульта", 15f, COLOR_TEXT, bold = true),
             spaced(label("Колесо CH6 — нахил камери\nКолесо CH11 — зум\nКнопка CH12 — центр\nКнопка CH13 — вниз 90°", 14f, COLOR_MUTED), 6),
+            spaced(label("Плаваюча кнопка C12", 15f, COLOR_TEXT, bold = true), 14),
+            spaced(label("Дотик — увімкнути/вимкнути керування\nПеретягування — перемістити\nУтримання — відкрити застосунок\nЗакрити повністю — «Закрити» у сповіщенні", 14f, COLOR_MUTED), 6),
         )
 
         hint = label("", 14f, COLOR_WARN).apply { visibility = View.GONE }
@@ -214,6 +198,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             addView(spaced(toggleButton, 14, height = dp(76)))
             addView(spaced(quickRow, 12))
             addView(spaced(live, 12))
+            addView(spaced(overlayButton, 12, height = dp(56)))
         }
         val right = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -290,7 +275,8 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
     private fun refreshStatus() {
         if (!::toggleButton.isInitialized) return
-        val rcOk = rcService != null && channelsReceived
+        val service = gimbal
+        val rcOk = service != null && service.rcConnected && service.channelsReceived
         rcStatus.text = if (rcOk) "●  Пульт: підключено" else "●  Пульт: очікування…"
         rcStatus.background = rounded(if (rcOk) COLOR_OK_DIM else COLOR_WARN_DIM, 20)
         rcStatus.setTextColor(if (rcOk) COLOR_OK_TEXT else COLOR_WARN)
@@ -308,7 +294,9 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         hint.text = hintText
         hint.visibility = if (hintText.isEmpty()) View.GONE else View.VISIBLE
 
-        val active = c12 != null
+        overlayButton.visibility = if (android.provider.Settings.canDrawOverlays(this)) View.GONE else View.VISIBLE
+
+        val active = service?.controlActive == true
         toggleButton.text = if (active) "■  Вимкнути керування" else "▶  Увімкнути керування"
         toggleButton.background = rounded(if (active) COLOR_STOP else COLOR_OK)
         listOf(centerButton, downButton).forEach {
@@ -330,17 +318,11 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         }
     }
 
-    private fun manualCommand(command: String, what: String) {
-        if (c12 == null) return
-        lastPitchSpeed = 0
-        sendC12(command, what)
-    }
-
     private fun updateLive(ch: Map<String, Int>) {
         if (!::pitchBar.isInitialized) return
         ch[CH_PITCH]?.let { v ->
             pitchBar.progress = (v - WHEEL_CENTER + WHEEL_SPAN).coerceIn(0, WHEEL_SPAN * 2)
-            val speed = wheelToSpeed(v, MAX_PITCH_SPEED)
+            val speed = GimbalService.wheelToSpeed(v, GimbalService.MAX_PITCH_SPEED)
             pitchLabel.text = "Нахил: " + when {
                 speed > 0 -> "вгору, швидкість $speed"
                 speed < 0 -> "вниз, швидкість ${-speed}"
@@ -349,7 +331,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         }
         ch[CH_ZOOM]?.let { v ->
             zoomBar.progress = (v - WHEEL_CENTER + WHEEL_SPAN).coerceIn(0, WHEEL_SPAN * 2)
-            zoomLabel.text = "Зум: " + when (wheelToSpeed(v, 1)) {
+            zoomLabel.text = "Зум: " + when (GimbalService.wheelToSpeed(v, 1)) {
                 1 -> "збільшення"
                 -1 -> "зменшення"
                 else -> "без змін"
@@ -359,8 +341,8 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
     override fun onDestroy() {
         try { inputManager.unregisterInputDeviceListener(this) } catch (_: Exception) {}
-        stopController()
-        stopRcProbe()
+        gimbal?.listener = null
+        try { unbindService(gimbalConnection) } catch (_: Exception) {}
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
@@ -504,201 +486,11 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     override fun onInputDeviceRemoved(deviceId: Int) { logEvent("INPUT DEVICE REMOVED id=$deviceId"); runFullScan() }
     override fun onInputDeviceChanged(deviceId: Int) { logEvent("INPUT DEVICE CHANGED id=$deviceId"); runFullScan() }
 
-    private fun startRcProbe() {
-        rcChannelValues.clear()
-        rcCallbackCounts.clear()
-        val intent = Intent().setComponent(ComponentName(RC_PACKAGE, RC_SERVICE_CLASS))
-        rcBound = try {
-            bindService(intent, rcConnection, Context.BIND_AUTO_CREATE)
-        } catch (e: Exception) {
-            logEvent("RC PROBE: bindService помилка ${e.javaClass.simpleName}: ${e.message}")
-            false
-        }
-        logEvent(if (rcBound) "RC PROBE: bindService OK, чекаю підключення… Рухай стіки/колеса." else "RC PROBE: bindService повернув false (сервіс недоступний)")
-        if (rcBound) handler.postDelayed(rcStatsTask, RC_STATS_INTERVAL_MS)
-    }
-
-    private fun stopRcProbe() {
-        if (!rcBound) return
-        handler.removeCallbacks(rcStatsTask)
-        rcTransact(RC_TX_STOP_CHANNELS, "зупинка потоку каналів (tx 41)", withCallback = false)
-        rcTransact(RC_TX_UNREGISTER_CALLBACK, "зняття колбека", withCallback = true)
-        try { unbindService(rcConnection) } catch (_: Exception) {}
-        rcBound = false
-        rcService = null
-        logEvent("RC PROBE зупинено")
-    }
-
-    // Transactions 1/2 of IRemoteControl take only our callback binder (register/unregister, nothing reaches the RC).
-    // 40/41 take no arguments: the service tells the RC MCU to start/stop reporting channels (module 16, cmd 1, byte 1/0).
-    private fun rcTransact(code: Int, what: String, withCallback: Boolean) {
-        val service = rcService ?: return
-        val data = Parcel.obtain()
-        val reply = Parcel.obtain()
-        try {
-            data.writeInterfaceToken(RC_SERVICE_DESCRIPTOR)
-            if (withCallback) data.writeStrongBinder(rcCallback)
-            service.transact(code, data, reply, 0)
-            reply.readException()
-            logEvent("RC PROBE: $what OK")
-        } catch (e: Exception) {
-            logEvent("RC PROBE: $what помилка ${e.javaClass.simpleName}: ${e.message}")
-        } finally {
-            data.recycle()
-            reply.recycle()
-        }
-    }
-
-    // Parcel layout of List<biz.siyi.protocol.bu.rcu.ChannelValue>: size, then per item non-null flag, enum name, value.
-    private fun readChannelValues(data: Parcel): List<Pair<String, Int>> {
-        val size = data.readInt()
-        val result = ArrayList<Pair<String, Int>>()
-        for (i in 0 until size) {
-            if (data.readInt() == 0) continue
-            val channel = data.readString() ?: "?"
-            result.add(channel to data.readInt())
-        }
-        return result
-    }
-
-    private fun onRcCallback(code: Int, channels: List<Pair<String, Int>>?) {
-        val count = (rcCallbackCounts[code] ?: 0) + 1
-        rcCallbackCounts[code] = count
-        if (channels == null) {
-            if (count == 1) logEvent("RC CALLBACK code=$code (перший раз)")
-            return
-        }
-        val changed = StringBuilder()
-        for ((channel, value) in channels) {
-            val key = "$code/$channel"
-            val last = rcChannelValues[key]
-            if (last == null || kotlin.math.abs(value - last) > RC_CHANNEL_EPS) {
-                rcChannelValues[key] = value
-                changed.append(" ${channel.removePrefix("CHANNEL_").let { "CH$it" }}=$value")
-            }
-        }
-        if (changed.isNotEmpty()) logEvent("RC CHANNELS code=$code n=${channels.size}:$changed")
-        if (code == RC_CB_CHANNELS_B) {
-            val map = channels.toMap()
-            if (!channelsReceived) {
-                channelsReceived = true
-                refreshStatus()
-            }
-            updateLive(map)
-            if (c12 != null) controlGimbal(map)
-        }
-    }
-
-    private fun startController() {
-        c12 = C12Client(onError = { msg -> handler.post { logEvent(msg) } })
-        lastPitchSpeed = 0
-        buttonPressed.clear()
-        zoomDirection = 0
-        if (!rcBound) startRcProbe()
-        handler.postDelayed(watchdogTask, WATCHDOG_INTERVAL_MS)
-        logEvent("CONTROLLER увімкнено: $CH_PITCH=нахил, $CH_CENTER=центр, $CH_DOWN90=вниз 90°, $CH_ZOOM=зум")
-    }
-
-    private fun stopController() {
-        val client = c12 ?: return
-        handler.removeCallbacks(watchdogTask)
-        handler.removeCallbacks(zoomTask)
-        zoomDirection = 0
-        client.send(C12Protocol.stop())
-        client.close()
-        c12 = null
-        logEvent("CONTROLLER вимкнено, надіслано STOP")
-    }
-
-    private fun sendC12(command: String, what: String) {
-        c12?.send(command)
-        logEvent("C12 → $what: $command")
-        if (::lastCommand.isInitialized) lastCommand.text = "Остання команда: $what  ·  ${timeFormat.format(Date())}"
-    }
-
-    private fun controlGimbal(ch: Map<String, Int>) {
-        ch[CH_PITCH]?.let { value ->
-            val speed = wheelToSpeed(value, MAX_PITCH_SPEED)
-            if (speed != lastPitchSpeed) {
-                lastPitchSpeed = speed
-                sendC12(C12Protocol.pitchSpeed(speed), if (speed == 0) "стоп" else "нахил $speed")
-            }
-        }
-        if (risingEdge(ch, CH_CENTER)) {
-            lastPitchSpeed = 0
-            sendC12(C12Protocol.center(), "центр")
-        }
-        if (risingEdge(ch, CH_DOWN90)) {
-            lastPitchSpeed = 0
-            sendC12(C12Protocol.pitchAbsolute(-90, DOWN90_SPEED), "вниз 90°")
-        }
-        ch[CH_ZOOM]?.let { value ->
-            val direction = wheelToSpeed(value, 1)
-            if (direction != zoomDirection) {
-                zoomDirection = direction
-                logEvent("ZOOM ${when (direction) { 1 -> "збільшення"; -1 -> "зменшення"; else -> "стоп" }}")
-                handler.removeCallbacks(zoomTask)
-                if (direction != 0) handler.post(zoomTask)
-            }
-        }
-    }
-
-    /** Maps a 1050..1950 wheel to -max..max with a dead zone around 1500. */
-    private fun wheelToSpeed(value: Int, max: Int): Int {
-        val d = value - WHEEL_CENTER
-        val mag = kotlin.math.abs(d) - WHEEL_DEADZONE
-        if (mag <= 0) return 0
-        val scaled = (mag * max + WHEEL_SPAN - WHEEL_DEADZONE - 1) / (WHEEL_SPAN - WHEEL_DEADZONE)
-        return Integer.signum(d) * scaled.coerceIn(1, max)
-    }
-
-    private fun risingEdge(ch: Map<String, Int>, channel: String): Boolean {
-        val value = ch[channel] ?: return false
-        val pressed = value > WHEEL_CENTER
-        val was = buttonPressed.put(channel, pressed) ?: pressed
-        return pressed && !was
-    }
-
-    // Zoom is step-based: one step every ZOOM_STEP_MS while the wheel is off-centre.
-    private val zoomTask = object : Runnable {
-        override fun run() {
-            val client = c12 ?: return
-            if (zoomDirection == 0 || rcService == null) return
-            client.send(if (zoomDirection > 0) C12Protocol.zoomIn() else C12Protocol.zoomOut())
-            handler.postDelayed(this, ZOOM_STEP_MS)
-        }
-    }
-
-    // The service sends channel frames only on change, so a held wheel produces no frames:
-    // repeat the current speed while moving, and stop if the channel source is gone.
-    private val watchdogTask = object : Runnable {
-        override fun run() {
-            if (lastPitchSpeed != 0) {
-                if (rcService == null) {
-                    lastPitchSpeed = 0
-                    sendC12(C12Protocol.stop(), "стоп (сервіс каналів недоступний)")
-                } else {
-                    c12?.send(C12Protocol.pitchSpeed(lastPitchSpeed))
-                }
-            }
-            handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
-        }
-    }
-
-    private val rcStatsTask = object : Runnable {
-        override fun run() {
-            val stats = rcCallbackCounts.entries.sortedBy { it.key }.joinToString(" ") { "${it.key}:${it.value}" }
-            logEvent("RC STATS (code:кількість) ${stats.ifEmpty { "колбеків ще не було" }}")
-            handler.postDelayed(this, RC_STATS_INTERVAL_MS)
-        }
-    }
-
     private fun report(line: String) {
         scanLog.append(line).append('\n')
     }
 
     private fun logEvent(line: String) {
-        Log.i(LOG_TAG, line)
         events.addLast("${timeFormat.format(Date())} $line")
         while (events.size > MAX_EVENT_LINES) events.removeFirst()
         scheduleRender()
@@ -721,33 +513,10 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     private companion object {
         const val MAX_EVENT_LINES = 500
         const val RENDER_INTERVAL_MS = 100L
-        const val LOG_TAG = "UniRcDiag"
-
-        // Taken from decompiled UniGCS (biz.siyi.remotecontrol): IRemoteControl / IRemoteCallback binder contract.
-        const val RC_PACKAGE = "biz.siyi.remotecontrol"
-        const val RC_SERVICE_CLASS = "biz.siyi.pilot.rcuservice.RemoteControlService"
-        const val RC_SERVICE_DESCRIPTOR = "biz.siyi.pilot.rcuservice.IRemoteControl"
-        const val RC_CALLBACK_DESCRIPTOR = "biz.siyi.pilot.rcuservice.callback.IRemoteCallback"
-        const val RC_TX_REGISTER_CALLBACK = 1
-        const val RC_TX_UNREGISTER_CALLBACK = 2
-        const val RC_TX_START_CHANNELS = 40
-        const val RC_TX_STOP_CHANNELS = 41
-        const val RC_CB_CHANNELS_A = 7
-        const val RC_CB_CHANNELS_B = 8
-        const val RC_CHANNEL_EPS = 3
-        const val RC_STATS_INTERVAL_MS = 5000L
-
-        // Controller mapping (values seen on hardware: 1050..1950, centre 1500).
-        const val CH_PITCH = "CHANNEL_6"
-        const val CH_ZOOM = "CHANNEL_11"
-        const val CH_CENTER = "CHANNEL_12"
-        const val CH_DOWN90 = "CHANNEL_13"
-        const val WHEEL_CENTER = 1500
-        const val WHEEL_SPAN = 450
-        const val WHEEL_DEADZONE = 45
-        const val MAX_PITCH_SPEED = 50
-        const val DOWN90_SPEED = 30
-        const val WATCHDOG_INTERVAL_MS = 200L
+        const val WHEEL_CENTER = GimbalService.WHEEL_CENTER
+        const val WHEEL_SPAN = GimbalService.WHEEL_SPAN
+        const val CH_PITCH = GimbalService.CH_PITCH
+        const val CH_ZOOM = GimbalService.CH_ZOOM
         const val STATUS_INTERVAL_MS = 1000L
         const val CAMERA_INTERFACE = "usb0"
 
@@ -763,6 +532,5 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         val COLOR_WARN = android.graphics.Color.parseColor("#F5B841")
         val COLOR_WARN_DIM = android.graphics.Color.parseColor("#3D3220")
         val COLOR_STOP = android.graphics.Color.parseColor("#B3261E")
-        const val ZOOM_STEP_MS = 90L
     }
 }
