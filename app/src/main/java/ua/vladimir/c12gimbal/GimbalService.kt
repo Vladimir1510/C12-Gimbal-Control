@@ -64,6 +64,11 @@ class GimbalService : Service() {
 
     private var overlay: TextView? = null
 
+    // Video-link chain ground unit -> air unit -> camera; null until the first check finishes.
+    private val linkMonitor = LinkMonitor { state -> handler.post { onLinkState(state) } }
+    var link: LinkMonitor.State? = null
+        private set
+
     /**
      * Raw implementation of biz.siyi.pilot.rcuservice.callback.IRemoteCallback.
      * Logs every incoming transaction code, decodes codes 7/8 as List<ChannelValue>.
@@ -115,6 +120,7 @@ class GimbalService : Service() {
         startForeground(NOTIF_ID, buildNotification())
         startRcProbe()
         showOverlay()
+        linkMonitor.start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -134,6 +140,7 @@ class GimbalService : Service() {
     override fun onDestroy() {
         stopController()
         stopRcProbe()
+        linkMonitor.stop()
         removeOverlay()
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
@@ -239,9 +246,24 @@ class GimbalService : Service() {
         view.background = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             setColor(if (controlActive) COLOR_OK else if (ready) COLOR_STOP else COLOR_IDLE)
-            setStroke((2 * resources.displayMetrics.density).toInt(), Color.WHITE)
+            // Yellow ring: the camera does not answer, so commands go nowhere.
+            val cameraLost = link?.let { it.camera == null } == true
+            setStroke(((if (cameraLost) 4 else 2) * resources.displayMetrics.density).toInt(), if (cameraLost) COLOR_LINK_WARN else Color.WHITE)
         }
         view.alpha = 0.9f
+    }
+
+    private fun onLinkState(state: LinkMonitor.State) {
+        val old = link
+        link = state
+        fun up(v: Int?) = v != null
+        if (old == null || up(old.ground) != up(state.ground) || up(old.air) != up(state.air) || up(old.camera) != up(state.camera)) {
+            fun mark(v: Int?) = v?.let { "OK ${it} мс" } ?: "немає"
+            log("ЗВ'ЯЗОК: наземний ${mark(state.ground)}, ейр-юніт ${mark(state.air)}, камера ${mark(state.camera)}")
+            stateChanged()
+        } else {
+            listener?.onStateChanged()
+        }
     }
 
     private fun stateChanged() {
@@ -261,12 +283,21 @@ class GimbalService : Service() {
         return Notification.Builder(this, NOTIF_CHANNEL)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setContentTitle("C12 Gimbal")
-            .setContentText(if (controlActive) "Керування увімкнено" else "Керування вимкнено")
+            .setContentText((if (controlActive) "Керування увімкнено" else "Керування вимкнено") + linkSummary())
             .setOngoing(true)
             .setContentIntent(open)
             .addAction(Notification.Action.Builder(null, if (controlActive) "Вимкнути" else "Увімкнути", pending(ACTION_TOGGLE, 1)).build())
             .addAction(Notification.Action.Builder(null, "Закрити", pending(ACTION_EXIT, 2)).build())
             .build()
+    }
+
+    private fun linkSummary(): String {
+        val state = link ?: return ""
+        return when {
+            state.camera != null -> " · камера на зв'язку"
+            state.air != null -> " · камера НЕ відповідає"
+            else -> " · немає зв'язку з дроном"
+        }
     }
 
     // ---------- RC channels (UniGCS) ----------
@@ -501,6 +532,7 @@ class GimbalService : Service() {
         private val COLOR_OK = Color.parseColor("#1F8A4C")
         private val COLOR_STOP = Color.parseColor("#B3261E")
         private val COLOR_IDLE = Color.parseColor("#5A6473")
+        private val COLOR_LINK_WARN = Color.parseColor("#FFC107")
 
         /** Maps a 1050..1950 wheel to -max..max with a dead zone around 1500. */
         fun wheelToSpeed(value: Int, max: Int): Int {

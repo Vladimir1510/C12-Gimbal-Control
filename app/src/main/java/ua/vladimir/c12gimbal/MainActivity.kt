@@ -98,6 +98,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
     private lateinit var rcStatus: TextView
     private lateinit var camStatus: TextView
+    private lateinit var linkChain: TextView
     private lateinit var toggleButton: Button
     private lateinit var centerButton: Button
     private lateinit var downButton: Button
@@ -158,6 +159,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             addView(spaced(rcStatus, 0, 1f))
             addView(spaced(camStatus, 0, 1f).apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(10) })
         }
+        linkChain = label("", 14f, COLOR_MUTED)
 
         toggleButton = bigButton("", COLOR_OK) {
             gimbal?.let { it.setControlActive(!it.controlActive) }
@@ -194,6 +196,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             orientation = LinearLayout.VERTICAL
             addView(label("C12 Gimbal", 26f, COLOR_TEXT, bold = true))
             addView(spaced(statusRow, 12))
+            addView(spaced(linkChain, 8))
             addView(spaced(hint, 8))
             addView(spaced(toggleButton, 14, height = dp(76)))
             addView(spaced(quickRow, 12))
@@ -282,12 +285,28 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         rcStatus.setTextColor(if (rcOk) COLOR_OK_TEXT else COLOR_WARN)
 
         val camNet = cameraNetworkUp()
-        camStatus.text = if (camNet) "●  Мережа камери: є" else "●  Мережа камери: немає"
-        camStatus.background = rounded(if (camNet) COLOR_OK_DIM else COLOR_WARN_DIM, 20)
-        camStatus.setTextColor(if (camNet) COLOR_OK_TEXT else COLOR_WARN)
+        val link = service?.link
+        val camOk = camNet && link?.camera != null
+        camStatus.text = when {
+            !camNet -> "●  Камера: немає мережі"
+            link == null -> "●  Камера: перевірка…"
+            camOk -> "●  Камера: на зв'язку"
+            else -> "●  Камера: не відповідає"
+        }
+        camStatus.background = rounded(if (camOk) COLOR_OK_DIM else COLOR_WARN_DIM, 20)
+        camStatus.setTextColor(if (camOk) COLOR_OK_TEXT else COLOR_WARN)
+
+        fun node(name: String, rtt: Int?) = if (rtt != null) "$name ✓ $rtt мс" else "$name ✕"
+        linkChain.text = if (camNet && link != null) {
+            "Пульт → ${node("наземний", link.ground)} → ${node("ейр-юніт", link.air)} → ${node("камера", link.camera)}"
+        } else ""
+        linkChain.visibility = if (linkChain.text.isEmpty()) View.GONE else View.VISIBLE
 
         val hintText = when {
             !camNet -> "Немає мережі камери (usb0). Перевірте, що дрон увімкнено, і від'єднайте USB-кабель пульта від комп'ютера."
+            link != null && link.ground == null -> "Наземний модуль пульта не відповідає. Перезавантажте пульт."
+            link != null && link.air == null -> "Немає радіозв'язку з ейр-юнітом. Перевірте живлення дрона й антени."
+            link != null && link.camera == null -> "Ейр-юніт на зв'язку, але камера C12 не відповідає. Перевірте живлення камери й кабель між камерою та ейр-юнітом."
             !rcOk -> "Немає даних з пульта. Переконайтеся, що застосунок UniGCS встановлено."
             else -> ""
         }
