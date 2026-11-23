@@ -54,6 +54,12 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     private val rcChannelValues = HashMap<String, Int>()
     private val rcCallbackCounts = HashMap<Int, Int>()
 
+    // Gimbal controller: RC channels (via the probe above) -> C12 UDP commands.
+    private var c12: C12Client? = null
+    private var lastPitchSpeed = 0
+    private var zoomWarned = false
+    private val buttonPressed = HashMap<String, Boolean>()
+
     /**
      * Raw implementation of biz.siyi.pilot.rcuservice.callback.IRemoteCallback.
      * Only listens: logs every incoming transaction code, decodes codes 7/8 as List<ChannelValue>.
@@ -88,6 +94,10 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         override fun onServiceDisconnected(name: ComponentName) {
             rcService = null
             logEvent("RC SERVICE відключився (процес UniGCS зупинено?)")
+            if (c12 != null && lastPitchSpeed != 0) {
+                lastPitchSpeed = 0
+                sendC12(C12Protocol.stop(), "стоп (сервіс каналів відключився)")
+            }
         }
     }
 
@@ -100,7 +110,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             setPadding(18, 18, 18, 18)
         }
         val title = TextView(this).apply {
-            text = "UniRC 7 — діагностика (БЕЗ КОМАНД)\nUART не відкривається. UDP не використовується."
+            text = "UniRC 7 → C12 контролер\nUART не відкривається. Команди C12 — лише коли контролер увімкнено."
             textSize = 18f
         }
         root.addView(title)
@@ -137,6 +147,15 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         }
         root.addView(rcProbe)
 
+        val controller = Button(this).apply {
+            text = "Контролер C12: увімкнути"
+            setOnClickListener {
+                if (c12 == null) startController() else stopController()
+                text = if (c12 == null) "Контролер C12: увімкнути" else "Контролер C12: ВИМКНУТИ"
+            }
+        }
+        root.addView(controller)
+
         output = TextView(this).apply {
             textSize = 12f
             typeface = android.graphics.Typeface.MONOSPACE
@@ -155,6 +174,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
     override fun onDestroy() {
         try { inputManager.unregisterInputDeviceListener(this) } catch (_: Exception) {}
+        stopController()
         stopRcProbe()
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
@@ -373,6 +393,87 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             }
         }
         if (changed.isNotEmpty()) logEvent("RC CHANNELS code=$code n=${channels.size}:$changed")
+        if (code == RC_CB_CHANNELS_B && c12 != null) controlGimbal(channels.toMap())
+    }
+
+    private fun startController() {
+        c12 = C12Client(onError = { msg -> handler.post { logEvent(msg) } })
+        lastPitchSpeed = 0
+        buttonPressed.clear()
+        zoomWarned = false
+        if (!rcBound) startRcProbe()
+        handler.postDelayed(watchdogTask, WATCHDOG_INTERVAL_MS)
+        logEvent("CONTROLLER увімкнено: $CH_PITCH=нахил, $CH_CENTER=центр, $CH_DOWN90=вниз 90°, $CH_ZOOM=зум (не підтримується)")
+    }
+
+    private fun stopController() {
+        val client = c12 ?: return
+        handler.removeCallbacks(watchdogTask)
+        client.send(C12Protocol.stop())
+        client.close()
+        c12 = null
+        logEvent("CONTROLLER вимкнено, надіслано STOP")
+    }
+
+    private fun sendC12(command: String, what: String) {
+        c12?.send(command)
+        logEvent("C12 → $what: $command")
+    }
+
+    private fun controlGimbal(ch: Map<String, Int>) {
+        ch[CH_PITCH]?.let { value ->
+            val speed = wheelToSpeed(value, MAX_PITCH_SPEED)
+            if (speed != lastPitchSpeed) {
+                lastPitchSpeed = speed
+                sendC12(C12Protocol.pitchSpeed(speed), if (speed == 0) "стоп" else "нахил $speed")
+            }
+        }
+        if (risingEdge(ch, CH_CENTER)) {
+            lastPitchSpeed = 0
+            sendC12(C12Protocol.center(), "центр")
+        }
+        if (risingEdge(ch, CH_DOWN90)) {
+            lastPitchSpeed = 0
+            sendC12(C12Protocol.pitchAbsolute(-90, DOWN90_SPEED), "вниз 90°")
+        }
+        // Zoom command for C12 is not known yet (needs camera manual/SDK), so only warn once.
+        val zoom = ch[CH_ZOOM]
+        if (zoom != null && wheelToSpeed(zoom, 1) != 0 && !zoomWarned) {
+            zoomWarned = true
+            logEvent("ZOOM: $CH_ZOOM рухається, але команда зуму C12 ще не відома — нічого не надіслано")
+        }
+    }
+
+    /** Maps a 1050..1950 wheel to -max..max with a dead zone around 1500. */
+    private fun wheelToSpeed(value: Int, max: Int): Int {
+        val d = value - WHEEL_CENTER
+        val mag = kotlin.math.abs(d) - WHEEL_DEADZONE
+        if (mag <= 0) return 0
+        val scaled = (mag * max + WHEEL_SPAN - WHEEL_DEADZONE - 1) / (WHEEL_SPAN - WHEEL_DEADZONE)
+        return Integer.signum(d) * scaled.coerceIn(1, max)
+    }
+
+    private fun risingEdge(ch: Map<String, Int>, channel: String): Boolean {
+        val value = ch[channel] ?: return false
+        val pressed = value > WHEEL_CENTER
+        val was = buttonPressed.put(channel, pressed) ?: pressed
+        return pressed && !was
+    }
+
+    // The service sends channel frames only on change, so a held wheel produces no frames:
+    // repeat the current speed while moving, and stop if the channel source is gone.
+    private val watchdogTask = object : Runnable {
+        override fun run() {
+            if (lastPitchSpeed != 0) {
+                if (rcService == null) {
+                    lastPitchSpeed = 0
+                    sendC12(C12Protocol.stop(), "стоп (сервіс каналів недоступний)")
+                } else {
+                    c12?.send(C12Protocol.pitchSpeed(lastPitchSpeed))
+                }
+            }
+            handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+        }
     }
 
     private val rcStatsTask = object : Runnable {
@@ -426,5 +527,17 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         const val RC_CB_CHANNELS_B = 8
         const val RC_CHANNEL_EPS = 3
         const val RC_STATS_INTERVAL_MS = 5000L
+
+        // Controller mapping (values seen on hardware: 1050..1950, centre 1500).
+        const val CH_PITCH = "CHANNEL_6"
+        const val CH_ZOOM = "CHANNEL_11"
+        const val CH_CENTER = "CHANNEL_12"
+        const val CH_DOWN90 = "CHANNEL_13"
+        const val WHEEL_CENTER = 1500
+        const val WHEEL_SPAN = 450
+        const val WHEEL_DEADZONE = 45
+        const val MAX_PITCH_SPEED = 25
+        const val DOWN90_SPEED = 20
+        const val WATCHDOG_INTERVAL_MS = 200L
     }
 }

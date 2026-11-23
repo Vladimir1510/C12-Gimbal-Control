@@ -1,5 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
+    <!-- UDP commands to the C12 camera (192.168.144.108:5000). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <!-- Diagnostic build: needed to see SIYI/vendor packages on Android 11+ (package visibility). -->
     <uses-permission
         android:name="android.permission.QUERY_ALL_PACKAGES"
