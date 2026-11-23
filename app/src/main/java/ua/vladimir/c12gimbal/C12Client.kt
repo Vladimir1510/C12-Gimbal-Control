@@ -46,12 +46,18 @@ class C12Client(
     private val executor = Executors.newSingleThreadExecutor()
     private var socket: DatagramSocket? = null
 
+    /**
+     * Send to the subnet broadcast instead of [host]. On some C12 boots (new random MAC each boot) unicast to the
+     * camera is lost on the radio link while broadcast still reaches it (verified on hardware).
+     */
+    @Volatile var broadcast = false
+
     fun send(command: String) {
         executor.execute {
             try {
-                val s = socket ?: DatagramSocket().also { socket = it }
+                val s = socket ?: DatagramSocket().also { it.broadcast = true; socket = it }
                 val bytes = command.toByteArray(Charsets.US_ASCII)
-                s.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(host), port))
+                s.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(if (broadcast) BROADCAST_IP else host), port))
             } catch (e: Exception) {
                 onError("C12 send '$command' помилка ${e.javaClass.simpleName}: ${e.message}")
             }
@@ -66,5 +72,6 @@ class C12Client(
     companion object {
         const val CAMERA_IP = "192.168.144.108"
         const val CAMERA_PORT = 5000
+        const val BROADCAST_IP = "192.168.144.255"
     }
 }

@@ -258,6 +258,14 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
                 logEvent("Звіт скопійовано в буфер обміну")
             }, 0, 1f).apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(8) })
         }
+        // Bad starts: the camera answers ARP (broadcast) but not unicast; check whether a broadcast command reaches it.
+        val broadcastTest = small("Тест: вниз 90° широкомовно (192.168.144.255)") {
+            val client = C12Client(host = C12Client.BROADCAST_IP, onError = { msg -> handler.post { logEvent(msg) } })
+            val command = C12Protocol.pitchAbsolute(-90, GimbalService.DOWN90_SPEED)
+            client.send(command)
+            client.close()
+            logEvent("C12 → вниз 90° широкомовно: $command")
+        }
         output = TextView(this).apply {
             textSize = 12f
             typeface = android.graphics.Typeface.MONOSPACE
@@ -272,6 +280,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(buttons)
+            addView(spaced(broadcastTest, 8))
             addView(spaced(scroll, 8, height = dp(360)))
         }
     }
@@ -306,7 +315,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             !camNet -> "Немає мережі камери (usb0). Перевірте, що дрон увімкнено, і від'єднайте USB-кабель пульта від комп'ютера."
             link != null && link.ground == null -> "Наземний модуль пульта не відповідає. Перезавантажте пульт."
             link != null && link.air == null -> "Немає радіозв'язку з ейр-юнітом. Перевірте живлення дрона й антени."
-            link != null && link.camera == null -> "Ейр-юніт на зв'язку, але камера C12 не відповідає. Перевірте живлення камери й кабель між камерою та ейр-юнітом."
+            link != null && link.camera == null -> "Камера не відповідає на адресні пакети (відомий збій C12 на старті). Команди керування йдуть широкомовно й мають працювати; відео може не бути — перезапустіть дрон."
             !rcOk -> "Немає даних з пульта. Переконайтеся, що застосунок UniGCS встановлено."
             else -> ""
         }

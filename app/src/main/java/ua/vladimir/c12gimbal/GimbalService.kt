@@ -257,12 +257,25 @@ class GimbalService : Service() {
         val old = link
         link = state
         fun up(v: Int?) = v != null
+        applyBroadcastMode()
         if (old == null || up(old.ground) != up(state.ground) || up(old.air) != up(state.air) || up(old.camera) != up(state.camera)) {
             fun mark(v: Int?) = v?.let { "OK ${it} мс" } ?: "немає"
             log("ЗВ'ЯЗОК: наземний ${mark(state.ground)}, ейр-юніт ${mark(state.air)}, камера ${mark(state.camera)}")
             stateChanged()
         } else {
             listener?.onStateChanged()
+        }
+    }
+
+    /** True while commands go to the broadcast address because the camera does not answer unicast. */
+    val broadcastMode: Boolean get() = link?.let { it.air != null && it.camera == null } == true
+
+    private fun applyBroadcastMode() {
+        val client = c12 ?: return
+        val mode = broadcastMode
+        if (client.broadcast != mode) {
+            client.broadcast = mode
+            log(if (mode) "C12: камера не відповідає на адресні пакети — команди йдуть широкомовно (${C12Client.BROADCAST_IP})" else "C12: камера знову на зв'язку — команди йдуть напряму")
         }
     }
 
@@ -295,7 +308,7 @@ class GimbalService : Service() {
         val state = link ?: return ""
         return when {
             state.camera != null -> " · камера на зв'язку"
-            state.air != null -> " · камера НЕ відповідає"
+            state.air != null -> " · камера НЕ відповідає, команди широкомовно"
             else -> " · немає зв'язку з дроном"
         }
     }
@@ -396,6 +409,7 @@ class GimbalService : Service() {
         buttonPressed.clear()
         zoomDirection = 0
         if (!rcBound) startRcProbe()
+        applyBroadcastMode()
         handler.postDelayed(watchdogTask, WATCHDOG_INTERVAL_MS)
         log("CONTROLLER увімкнено: $CH_PITCH=нахил, $CH_CENTER=центр, $CH_DOWN90=вниз 90°, $CH_ZOOM=зум")
     }
