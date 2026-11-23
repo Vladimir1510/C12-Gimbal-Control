@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - taras
 
 permissions:
   contents: read
