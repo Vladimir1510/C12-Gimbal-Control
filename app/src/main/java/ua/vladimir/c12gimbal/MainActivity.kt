@@ -2,485 +2,542 @@
 package ua.vladimir.c12gimbal
 
 import android.app.Activity
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
-import android.content.pm.PackageManager
-import android.hardware.input.InputManager
-import android.os.Build
 import android.os.Bundle
-import android.view.InputDevice
-import android.view.KeyEvent
+import android.os.Handler
+import android.os.Looper
 import android.view.MotionEvent
+import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Read-only diagnostics for UniRC 7.
- * Does not open UART, create UDP sockets, or send commands.
- */
-class MainActivity : Activity(), InputManager.InputDeviceListener {
+class MainActivity : Activity() {
 
-    private lateinit var output: TextView
-    private lateinit var inputManager: InputManager
+    private lateinit var cameraIp: EditText
+    private lateinit var speedLabel: TextView
+    private lateinit var statusLabel: TextView
+    private lateinit var logView: TextView
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val networkExecutor = Executors.newSingleThreadExecutor()
+    private val shuttingDown = AtomicBoolean(false)
+
+    private val timeFormat =
+        SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
     private val log = StringBuilder()
-    private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    private val maxLogChars = 30000
 
-    private val maxLogChars = 100000
+    private val cameraPort = 5000
+
+    // 20 = 2.0 degrees/second according to the protocol.
+    private var movementSpeed = 20
+
+    private var heldCommand: String? = null
+    private var heldSpeed = 0
+
+    private val repeatIntervalMs = 200L
+
+    private val repeatRunnable = object : Runnable {
+        override fun run() {
+            val command = heldCommand ?: return
+
+            sendSpeedCommand(command, heldSpeed)
+
+            if (heldCommand != null) {
+                mainHandler.postDelayed(this, repeatIntervalMs)
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        try {
-            inputManager =
-                getSystemService(Context.INPUT_SERVICE) as InputManager
+        buildInterface()
 
-            val root = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(18, 18, 18, 18)
-            }
+        appendLog("Застосунок запущено.")
+        appendLog("UDP: порт камери $cameraPort")
+        appendLog("UART не використовується.")
+        appendLog("Камера: ${cameraIp.text}")
 
-            val title = TextView(this).apply {
-                text = "UniRC 7 — діагностика (БЕЗ КОМАНД)\n" +
-                    "UART не відкривається. UDP не використовується."
-                textSize = 18f
-            }
-            root.addView(title)
+        updateStatus("Готовий до керування")
+    }
 
-            val refresh = Button(this).apply {
-                text = "Оновити список пристроїв і служб"
-                setOnClickListener {
-                    safeAction("Оновлення") {
-                        runFullScan()
-                    }
+    private fun buildInterface() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(18, 14, 18, 14)
+        }
+
+        val title = TextView(this).apply {
+            text = "SKYDROID C12 — UDP CONTROL"
+            textSize = 21f
+            setPadding(0, 0, 0, 12)
+        }
+        root.addView(title)
+
+        val description = TextView(this).apply {
+            text = "Ручне керування підвісом через UDP. " +
+                "Команди надсилаються без використання UART."
+            textSize = 13f
+        }
+        root.addView(description)
+
+        addSpace(root, 12)
+
+        root.addView(TextView(this).apply {
+            text = "IP-адреса камери:"
+            textSize = 15f
+        })
+
+        cameraIp = EditText(this).apply {
+            setSingleLine(true)
+            setText("192.168.144.108")
+            textSize = 17f
+        }
+        root.addView(cameraIp)
+
+        root.addView(TextView(this).apply {
+            text = "UDP порт: $cameraPort"
+            textSize = 14f
+        })
+
+        addSpace(root, 10)
+
+        statusLabel = TextView(this).apply {
+            textSize = 15f
+            text = "Статус: очікування"
+        }
+        root.addView(statusLabel)
+
+        addSpace(root, 12)
+
+        root.addView(TextView(this).apply {
+            text = "Швидкість руху:"
+            textSize = 16f
+        })
+
+        speedLabel = TextView(this).apply {
+            textSize = 15f
+        }
+        root.addView(speedLabel)
+
+        val speedBar = SeekBar(this).apply {
+            max = 60
+            progress = movementSpeed
+        }
+
+        speedBar.setOnSeekBarChangeListener(
+            object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(
+                    seekBar: SeekBar?,
+                    progress: Int,
+                    fromUser: Boolean
+                ) {
+                    movementSpeed = progress.coerceAtLeast(1)
+                    updateSpeedLabel()
                 }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
             }
-            root.addView(refresh)
-
-            val clear = Button(this).apply {
-                text = "Очистити журнал подій"
-                setOnClickListener {
-                    safeAction("Очищення журналу") {
-                        log.setLength(0)
-                        updateOutput()
-                        append("Журнал очищено")
-                    }
-                }
-            }
-            root.addView(clear)
-
-            val copy = Button(this).apply {
-                text = "Скопіювати звіт"
-                setOnClickListener {
-                    safeAction("Копіювання звіту") {
-                        val report = log.toString()
-
-                        val clipboard =
-                            getSystemService(Context.CLIPBOARD_SERVICE)
-                                as? ClipboardManager
-                                ?: throw IllegalStateException(
-                                    "ClipboardManager недоступний"
-                                )
-
-                        clipboard.setPrimaryClip(
-                            ClipData.newPlainText(
-                                "UniRC diagnostics",
-                                report
-                            )
-                        )
-
-                        append("Звіт скопійовано в буфер обміну")
-                    }
-                }
-            }
-            root.addView(copy)
-
-            output = TextView(this).apply {
-                textSize = 12f
-                typeface = android.graphics.Typeface.MONOSPACE
-                setTextIsSelectable(true)
-            }
-
-            val scroll = ScrollView(this)
-            scroll.addView(output)
-
-            root.addView(
-                scroll,
-                LinearLayout.LayoutParams(-1, 0, 1f)
-            )
-
-            setContentView(root)
-
-            inputManager.registerInputDeviceListener(this, null)
-
-            runFullScan()
-
-            append(
-                "\nТЕСТ ПОДІЙ: залиш цей екран відкритим " +
-                    "і рухай CH6/CH7, натискай CH12/CH13."
-            )
-
-            append(
-                "Події, які Android доставить саме цьому застосунку, " +
-                    "з'являться нижче."
-            )
-
-        } catch (e: Exception) {
-            android.util.Log.e("C12Diagnostics", "Помилка запуску", e)
-            showError("Помилка запуску: ${e.message}")
-        }
-    }
-
-    private fun safeAction(name: String, action: () -> Unit) {
-        try {
-            action()
-        } catch (e: Exception) {
-            android.util.Log.e(
-                "C12Diagnostics",
-                "$name failed",
-                e
-            )
-
-            try {
-                append("ПОМИЛКА $name: ${e.javaClass.simpleName}: ${e.message}")
-            } catch (_: Exception) {
-                showError("$name: ${e.message}")
-            }
-        }
-    }
-
-    private fun showError(message: String) {
-        try {
-            android.widget.Toast.makeText(
-                this,
-                message,
-                android.widget.Toast.LENGTH_LONG
-            ).show()
-        } catch (_: Exception) {
-            // Не допускаємо повторного аварійного завершення.
-        }
-    }
-
-    override fun onDestroy() {
-        try {
-            if (::inputManager.isInitialized) {
-                inputManager.unregisterInputDeviceListener(this)
-            }
-        } catch (e: Exception) {
-            android.util.Log.w(
-                "C12Diagnostics",
-                "Listener cleanup failed",
-                e
-            )
-        }
-
-        super.onDestroy()
-    }
-
-    private fun runFullScan() {
-        append(
-            "\n========== СКАНУВАННЯ " +
-                "${timeFormat.format(Date())} =========="
         )
 
-        append(
-            "Android=${Build.VERSION.RELEASE} " +
-                "API=${Build.VERSION.SDK_INT} " +
-                "виробник=${Build.MANUFACTURER} " +
-                "модель=${Build.MODEL}"
+        root.addView(speedBar)
+        updateSpeedLabel()
+
+        addSpace(root, 12)
+
+        root.addView(TextView(this).apply {
+            text = "КЕРУВАННЯ ПІДВІСОМ"
+            textSize = 17f
+        })
+
+        addSpace(root, 8)
+
+        val upRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        val upButton = createButton("▲ ВГОРУ")
+        upRow.addView(
+            upButton,
+            LinearLayout.LayoutParams(-1, 64)
+        )
+        root.addView(upRow)
+
+        val middleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        val leftButton = createButton("◀ ЛІВОРУЧ")
+        val rightButton = createButton("ПРАВОРУЧ ▶")
+
+        middleRow.addView(
+            leftButton,
+            LinearLayout.LayoutParams(0, 64, 1f)
         )
 
-        safeAction("Сканування input devices") {
-            scanInputDevices()
-        }
-
-        safeAction("Сканування системних служб") {
-            scanSystemServiceNames()
-        }
-
-        safeAction("Сканування пакетів") {
-            scanInstalledPackagesAndDeclaredServices()
-        }
-
-        append("========== КІНЕЦЬ СКАНУВАННЯ ==========")
-    }
-
-    private fun scanInputDevices() {
-        append("\n[ANDROID INPUT DEVICES]")
-
-        val ids = inputManager.inputDeviceIds
-
-        append("Кількість пристроїв: ${ids.size}")
-
-        if (ids.isEmpty()) {
-            append(
-                "Android не показує жодного " +
-                    "зовнішнього/віртуального input device."
-            )
-        }
-
-        for (id in ids) {
-            val d = inputManager.getInputDevice(id) ?: continue
-
-            append(
-                "Device id=${d.id}; name=${d.name}; " +
-                    "descriptor=${d.descriptor}"
-            )
-
-            append(
-                "  vendorId=${d.vendorId}; " +
-                    "productId=${d.productId}; " +
-                    "sources=0x${d.sources.toString(16)}; " +
-                    "virtual=${d.isVirtual}"
-            )
-
-            append(
-                "  keyboardType=${d.keyboardType}; " +
-                    "supportsSource(JOYSTICK)=" +
-                    d.supportsSource(InputDevice.SOURCE_JOYSTICK)
-            )
-
-            for (r in d.motionRanges) {
-                append(
-                    "  AXIS ${MotionEvent.axisToString(r.axis)}: " +
-                        "min=${r.min}, max=${r.max}, " +
-                        "flat=${r.flat}, fuzz=${r.fuzz}, " +
-                        "source=0x${r.source.toString(16)}"
-                )
-            }
-        }
-    }
-
-    private fun scanSystemServiceNames() {
-        append("\n[ANDROID SYSTEM SERVICES]")
-
-        val services = listOf(
-            "INPUT_SERVICE" to Context.INPUT_SERVICE,
-            "WINDOW_SERVICE" to Context.WINDOW_SERVICE,
-            "USB_SERVICE" to Context.USB_SERVICE,
-            "AUDIO_SERVICE" to Context.AUDIO_SERVICE,
-            "BLUETOOTH_SERVICE" to Context.BLUETOOTH_SERVICE,
-            "WIFI_SERVICE" to Context.WIFI_SERVICE,
-            "SENSOR_SERVICE" to Context.SENSOR_SERVICE,
-            "ACTIVITY_SERVICE" to Context.ACTIVITY_SERVICE,
-            "POWER_SERVICE" to Context.POWER_SERVICE
+        middleRow.addView(
+            rightButton,
+            LinearLayout.LayoutParams(0, 64, 1f)
         )
 
-        for ((name, serviceName) in services) {
-            try {
-                val service = getSystemService(serviceName)
+        root.addView(middleRow)
 
-                append(
-                    "$name: " +
-                        if (service != null) service.javaClass.name
-                        else "недоступний"
-                )
-            } catch (e: Exception) {
-                append("$name: помилка ${e.message}")
-            }
+        val downRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
         }
 
-        append(
-            "Примітка: перевірені доступні Android API. " +
-                "Це не повний список внутрішніх системних служб UniRC."
+        val downButton = createButton("▼ ВНИЗ")
+        downRow.addView(
+            downButton,
+            LinearLayout.LayoutParams(-1, 64)
+        )
+        root.addView(downRow)
+
+        bindHoldButton(upButton, "GSP", movementDirection = 1)
+        bindHoldButton(downButton, "GSP", movementDirection = -1)
+        bindHoldButton(rightButton, "GSY", movementDirection = 1)
+        bindHoldButton(leftButton, "GSY", movementDirection = -1)
+
+        addSpace(root, 10)
+
+        val centerButton = createButton("ЦЕНТРУВАТИ ПІДВІС")
+        centerButton.setOnClickListener {
+            stopMovement()
+            sendCommand("G", "PTZ", "05")
+            updateStatus("Надіслано команду центрування")
+        }
+        root.addView(centerButton)
+
+        addSpace(root, 8)
+
+        val zoomRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        val zoomIn = createButton("ZOOM +")
+        val zoomOut = createButton("ZOOM −")
+
+        zoomIn.setOnClickListener {
+            sendCommand("D", "DZM", "0A")
+            updateStatus("Надіслано Zoom +")
+        }
+
+        zoomOut.setOnClickListener {
+            sendCommand("D", "DZM", "0B")
+            updateStatus("Надіслано Zoom −")
+        }
+
+        zoomRow.addView(
+            zoomIn,
+            LinearLayout.LayoutParams(0, 58, 1f)
+        )
+
+        zoomRow.addView(
+            zoomOut,
+            LinearLayout.LayoutParams(0, 58, 1f)
+        )
+
+        root.addView(zoomRow)
+
+        addSpace(root, 8)
+
+        val stopButton = createButton("STOP — ЗУПИНИТИ ВСЕ")
+        stopButton.setOnClickListener {
+            stopMovement()
+            sendAllStopCommands()
+            updateStatus("Надіслано загальну зупинку")
+        }
+        root.addView(stopButton)
+
+        addSpace(root, 14)
+
+        root.addView(TextView(this).apply {
+            text = "ЖУРНАЛ UDP"
+            textSize = 17f
+        })
+
+        val clearButton = createButton("Очистити журнал")
+        clearButton.setOnClickListener {
+            log.setLength(0)
+            updateLog()
+            appendLog("Журнал очищено")
+        }
+        root.addView(clearButton)
+
+        logView = TextView(this).apply {
+            textSize = 11f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextIsSelectable(true)
+        }
+
+        val scroll = ScrollView(this)
+        scroll.addView(logView)
+
+        root.addView(
+            scroll,
+            LinearLayout.LayoutParams(-1, 0, 1f)
+        )
+
+        setContentView(root)
+    }
+
+    private fun createButton(label: String): Button {
+        return Button(this).apply {
+            text = label
+            textSize = 15f
+            isAllCaps = false
+        }
+    }
+
+    private fun addSpace(
+        parent: LinearLayout,
+        height: Int
+    ) {
+        parent.addView(
+            View(this),
+            LinearLayout.LayoutParams(1, height)
         )
     }
 
-    @Suppress("DEPRECATION")
-    private fun scanInstalledPackagesAndDeclaredServices() {
-        append("\n[ВСТАНОВЛЕНІ ПАКЕТИ ТА ОГОЛОШЕНІ SERVICES]")
+    private fun updateSpeedLabel() {
+        if (!::speedLabel.isInitialized) return
 
-        val pm = packageManager
+        speedLabel.text =
+            "Значення: $movementSpeed  |  " +
+            "приблизно ${movementSpeed / 10.0}°/с"
+    }
 
-        val packages = try {
-            if (Build.VERSION.SDK_INT >= 33) {
-                pm.getInstalledPackages(
-                    PackageManager.PackageInfoFlags.of(
-                        PackageManager.GET_SERVICES.toLong()
+    private fun bindHoldButton(
+        button: Button,
+        command: String,
+        movementDirection: Int
+    ) {
+        button.setOnTouchListener { _, event ->
+
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    startMovement(
+                        command,
+                        movementSpeed * movementDirection
                     )
-                )
-            } else {
-                pm.getInstalledPackages(PackageManager.GET_SERVICES)
+                    true
+                }
+
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> {
+                    stopMovement()
+                    true
+                }
+
+                else -> true
             }
+        }
+    }
+
+    private fun startMovement(
+        command: String,
+        speed: Int
+    ) {
+        stopMovement()
+
+        heldCommand = command
+        heldSpeed = speed
+
+        sendSpeedCommand(command, speed)
+
+        mainHandler.removeCallbacks(repeatRunnable)
+        mainHandler.postDelayed(
+            repeatRunnable,
+            repeatIntervalMs
+        )
+
+        updateStatus(
+            "Рух: $command, швидкість $speed"
+        )
+    }
+
+    private fun stopMovement() {
+        mainHandler.removeCallbacks(repeatRunnable)
+
+        val previousCommand = heldCommand
+
+        heldCommand = null
+        heldSpeed = 0
+
+        if (previousCommand != null) {
+            sendSpeedCommand(previousCommand, 0)
+            updateStatus("Зупинка осі $previousCommand")
+        }
+    }
+
+    private fun sendSpeedCommand(
+        command: String,
+        speed: Int
+    ) {
+        val safeSpeed = speed.coerceIn(-127, 127)
+
+        val byteValue =
+            if (safeSpeed < 0) {
+                256 + safeSpeed
+            } else {
+                safeSpeed
+            }
+
+        val payload =
+            String.format(Locale.US, "%02X", byteValue)
+
+        sendCommand("G", command, payload)
+    }
+
+    private fun sendAllStopCommands() {
+        sendSpeedCommand("GSP", 0)
+        sendSpeedCommand("GSY", 0)
+        sendCommand("G", "PTZ", "00")
+    }
+
+    /**
+     * Builds a fixed-length #TP command.
+     *
+     * Example:
+     * #TPUG2wPTZ056F
+     *
+     * Checksum = ASCII byte sum modulo 256.
+     */
+    private fun buildFrame(
+        destination: String,
+        command: String,
+        payload: String
+    ): String {
+        require(destination.length == 1)
+        require(command.length == 3)
+        require(payload.length == 2)
+
+        val base =
+            "#TPU${destination}2w${command}${payload}"
+
+        val checksum = base
+            .toByteArray(StandardCharsets.US_ASCII)
+            .sumOf { it.toInt() and 0xFF } and 0xFF
+
+        return base + String.format(
+            Locale.US,
+            "%02X",
+            checksum
+        )
+    }
+
+    private fun sendCommand(
+        destination: String,
+        command: String,
+        payload: String
+    ) {
+        if (shuttingDown.get()) return
+
+        val ip = cameraIp.text.toString().trim()
+
+        val frame = try {
+            buildFrame(destination, command, payload)
         } catch (e: Exception) {
-            append("Помилка читання пакетів: ${e.message}")
+            appendLog("ПОМИЛКА формування кадру: ${e.message}")
             return
         }
 
-        append(
-            "Видимих пакетів: ${packages.size}. " +
-                "Android може приховувати частину пакетів."
-        )
-
-        val hits = packages.filter { p ->
-            val s = p.packageName + " " +
-                (p.applicationInfo?.loadLabel(pm)?.toString() ?: "")
-
-            s.contains("siyi", true) ||
-                s.contains("skydroid", true) ||
-                s.contains("unirc", true) ||
-                s.contains("sky", true) ||
-                s.contains("rc", true)
-        }
-
-        if (hits.isEmpty()) {
-            append(
-                "Пакетів із назвами SIYI/SKYDROID/UniRC/RC " +
-                    "серед видимих не знайдено."
-            )
-        }
-
-        for (p in hits) {
-            val label = try {
-                p.applicationInfo?.loadLabel(pm)?.toString() ?: ""
-            } catch (_: Exception) {
-                ""
-            }
-
-            append("PACKAGE: $label | ${p.packageName}")
-
-            val services = p.services ?: emptyArray()
-
-            if (services.isEmpty()) {
-                append("  Оголошених services не знайдено/не видно.")
-            }
-
-            services.forEach { s ->
-                append(
-                    "  SERVICE: ${s.name}; " +
-                        "exported=${s.exported}; " +
-                        "permission=${s.permission ?: "(none)"}; " +
-                        "process=${s.processName}"
-                )
-            }
-        }
-
-        append("Інші пакети не виводяться, щоб звіт залишався компактним.")
-    }
-
-    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
-        if (
-            ev.action == MotionEvent.ACTION_MOVE ||
-            ev.action == MotionEvent.ACTION_HOVER_MOVE
-        ) {
-            val axes = StringBuilder()
-
-            for (i in 0 until ev.pointerCount) {
-                val names = intArrayOf(
-                    MotionEvent.AXIS_X,
-                    MotionEvent.AXIS_Y,
-                    MotionEvent.AXIS_Z,
-                    MotionEvent.AXIS_RZ,
-                    MotionEvent.AXIS_RX,
-                    MotionEvent.AXIS_RY,
-                    MotionEvent.AXIS_HAT_X,
-                    MotionEvent.AXIS_HAT_Y
+        networkExecutor.execute {
+            try {
+                val address = InetAddress.getByName(ip)
+                val data = frame.toByteArray(
+                    StandardCharsets.US_ASCII
                 )
 
-                names.forEach { axis ->
-                    val v = ev.getAxisValue(axis, i)
-
-                    if (kotlin.math.abs(v) > 0.02f) {
-                        axes.append(
-                            " ${MotionEvent.axisToString(axis)}=$v"
-                        )
-                    }
-                }
-            }
-
-            if (axes.isNotEmpty()) {
-                safeAction("Обробка INPUT MOTION") {
-                    append(
-                        "INPUT MOTION device=${ev.device?.name} " +
-                            "id=${ev.deviceId} " +
-                            "source=0x${ev.source.toString(16)}:$axes"
+                DatagramSocket().use { socket ->
+                    val packet = DatagramPacket(
+                        data,
+                        data.size,
+                        address,
+                        cameraPort
                     )
+
+                    socket.send(packet)
                 }
-            }
-        }
 
-        return super.dispatchGenericMotionEvent(ev)
-    }
+                appendLog("UDP TX → $ip:$cameraPort | $frame")
 
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (
-            event.action == KeyEvent.ACTION_DOWN ||
-            event.action == KeyEvent.ACTION_UP
-        ) {
-            safeAction("Обробка INPUT KEY") {
-                append(
-                    "INPUT KEY " +
-                        "${if (event.action == KeyEvent.ACTION_DOWN) "DOWN" else "UP"}: " +
-                        "device=${event.device?.name} " +
-                        "id=${event.deviceId} " +
-                        "keyCode=${event.keyCode} " +
-                        "(${KeyEvent.keyCodeToString(event.keyCode)}) " +
-                        "scanCode=${event.scanCode}"
+            } catch (e: Exception) {
+                appendLog(
+                    "UDP ПОМИЛКА: ${e.javaClass.simpleName}: " +
+                        "${e.message}"
+                )
+
+                updateStatus(
+                    "Помилка UDP: ${e.message}"
                 )
             }
         }
-
-        return super.dispatchKeyEvent(event)
     }
 
-    override fun onInputDeviceAdded(deviceId: Int) {
-        safeAction("INPUT DEVICE ADDED") {
-            append("INPUT DEVICE ADDED id=$deviceId")
-            scanInputDevices()
-        }
-    }
-
-    override fun onInputDeviceRemoved(deviceId: Int) {
-        safeAction("INPUT DEVICE REMOVED") {
-            append("INPUT DEVICE REMOVED id=$deviceId")
-            scanInputDevices()
-        }
-    }
-
-    override fun onInputDeviceChanged(deviceId: Int) {
-        safeAction("INPUT DEVICE CHANGED") {
-            append("INPUT DEVICE CHANGED id=$deviceId")
-            scanInputDevices()
-        }
-    }
-
-    private fun append(line: String) {
-        try {
-            log.append(line).append('\n')
+    private fun appendLog(message: String) {
+        runOnUiThread {
+            log.append(timeFormat.format(Date()))
+                .append("  ")
+                .append(message)
+                .append('\n')
 
             if (log.length > maxLogChars) {
-                val excess = log.length - maxLogChars
-                log.delete(0, excess.coerceAtMost(log.length))
+                log.delete(
+                    0,
+                    log.length - maxLogChars
+                )
             }
 
-            updateOutput()
-
-        } catch (e: Exception) {
-            android.util.Log.e(
-                "C12Diagnostics",
-                "Journal update failed",
-                e
-            )
+            updateLog()
         }
     }
 
-    private fun updateOutput() {
-        if (!::output.isInitialized) return
+    private fun updateLog() {
+        if (!::logView.isInitialized) return
 
-        try {
-            output.text = log.toString()
-        } catch (e: Exception) {
-            android.util.Log.e(
-                "C12Diagnostics",
-                "TextView update failed",
-                e
-            )
+        logView.text = log.toString()
+    }
+
+    private fun updateStatus(message: String) {
+        runOnUiThread {
+            if (::statusLabel.isInitialized) {
+                statusLabel.text = "Статус: $message"
+            }
         }
+    }
+
+    override fun onPause() {
+        stopMovement()
+        sendAllStopCommands()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        stopMovement()
+        sendAllStopCommands()
+
+        shuttingDown.set(true)
+        networkExecutor.shutdown()
+
+        mainHandler.removeCallbacksAndMessages(null)
+
+        super.onDestroy()
     }
 }
