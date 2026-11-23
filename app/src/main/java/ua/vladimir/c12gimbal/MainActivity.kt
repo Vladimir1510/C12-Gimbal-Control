@@ -185,7 +185,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             label("Керування з пульта", 15f, COLOR_TEXT, bold = true),
             spaced(label("Колесо CH6 — нахил камери\nКолесо CH11 — зум\nКнопка CH12 — центр\nКнопка CH13 — вниз 90°", 14f, COLOR_MUTED), 6),
             spaced(label("Плаваюча кнопка C12", 15f, COLOR_TEXT, bold = true), 14),
-            spaced(label("Дотик — увімкнути/вимкнути керування\nПеретягування — перемістити\nУтримання — відкрити застосунок\nЗакрити повністю — «Закрити» у сповіщенні", 14f, COLOR_MUTED), 6),
+            spaced(label("Зелена — керування працює, червона — вимкнене\nДотик — увімкнути/вимкнути керування\nПеретягування — перемістити\nУтримання — відкрити застосунок\nЗакрити повністю — «Закрити» у сповіщенні", 14f, COLOR_MUTED), 6),
         )
 
         hint = label("", 14f, COLOR_WARN).apply { visibility = View.GONE }
@@ -297,8 +297,9 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         overlayButton.visibility = if (android.provider.Settings.canDrawOverlays(this)) View.GONE else View.VISIBLE
 
         val active = service?.controlActive == true
-        toggleButton.text = if (active) "■  Вимкнути керування" else "▶  Увімкнути керування"
-        toggleButton.background = rounded(if (active) COLOR_STOP else COLOR_OK)
+        // Colour shows the state (green = controlling, red = off), the text says what a tap does.
+        toggleButton.text = if (active) "●  Керування працює — вимкнути" else "○  Керування вимкнено — увімкнути"
+        toggleButton.background = rounded(if (active) COLOR_OK else COLOR_STOP)
         listOf(centerButton, downButton).forEach {
             it.isEnabled = active
             it.alpha = if (active) 1f else 0.4f

@@ -238,7 +238,7 @@ class GimbalService : Service() {
         view.text = if (controlActive) "■\nC12" else "▶\nC12"
         view.background = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
-            setColor(if (controlActive) COLOR_STOP else if (ready) COLOR_OK else COLOR_IDLE)
+            setColor(if (controlActive) COLOR_OK else if (ready) COLOR_STOP else COLOR_IDLE)
             setStroke((2 * resources.displayMetrics.density).toInt(), Color.WHITE)
         }
         view.alpha = 0.9f
