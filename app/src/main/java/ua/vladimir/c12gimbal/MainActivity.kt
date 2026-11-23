@@ -2,6 +2,10 @@ package ua.vladimir.c12gimbal
 
 import android.app.Activity
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.Process
+import android.os.SystemClock
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -19,6 +23,8 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.LockSupport
 import kotlin.math.abs
 
 class MainActivity : Activity() {
@@ -26,10 +32,18 @@ class MainActivity : Activity() {
     private lateinit var uartStatus: TextView
     private lateinit var networkStatus: TextView
     private lateinit var udpStatus: TextView
+    private lateinit var uartRateStatus: TextView
+    private lateinit var rcAgeStatus: TextView
+    private lateinit var udpCh6Status: TextView
+    private lateinit var udpCh7Status: TextView
+    private lateinit var udpCh12Status: TextView
+    private lateinit var udpCh13Status: TextView
     private lateinit var rootLayout: LinearLayout
 
     private val channelViews = ArrayList<TextView>()
     private val importantViews = HashMap<Int, TextView>()
+
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile
     private var running = false
@@ -37,8 +51,15 @@ class MainActivity : Activity() {
     @Volatile
     private var latestChannels = IntArray(16)
 
-    @Volatile
-    private var lastRcPacketMs = 0L
+    // Час приймання RC-пакета за монотонним годинником Android.
+    private val lastRcPacketMs = AtomicLong(0L)
+    private val uartPacketsTotal = AtomicLong(0L)
+
+    // Лічильники збільшуються лише після успішного socket.send().
+    private val udpCh6Sent = AtomicLong(0L)
+    private val udpCh7Sent = AtomicLong(0L)
+    private val udpCh12Sent = AtomicLong(0L)
+    private val udpCh13Sent = AtomicLong(0L)
 
     private val cameraIp = "192.168.144.108"
     private val cameraPort = 5000
@@ -49,6 +70,62 @@ class MainActivity : Activity() {
     private val secondaryColor = Color.rgb(151, 169, 191)
     private val accentColor = Color.rgb(46, 213, 180)
     private val warningColor = Color.rgb(255, 190, 92)
+
+    private val uiRefresh = object : Runnable {
+        private var previousUartTotal = 0L
+        private var previousRateTime = 0L
+        private var packetsPerSecond = 0L
+
+        override fun run() {
+            if (!running) return
+
+            val channels = latestChannels
+            val total = uartPacketsTotal.get()
+            val now = SystemClock.elapsedRealtime()
+
+            if (previousRateTime == 0L) {
+                previousRateTime = now
+                previousUartTotal = total
+            } else if (now - previousRateTime >= 1000L) {
+                val elapsed = now - previousRateTime
+                packetsPerSecond = ((total - previousUartTotal) * 1000L / elapsed)
+                previousUartTotal = total
+                previousRateTime = now
+            }
+
+            uartRateStatus.text =
+                "UART: $packetsPerSecond пакетів/с  •  всього: $total"
+
+            val lastPacket = lastRcPacketMs.get()
+            if (lastPacket == 0L) {
+                rcAgeStatus.text = "Останній RC-пакет: ще не отримано"
+                rcAgeStatus.setTextColor(warningColor)
+            } else {
+                val age = (now - lastPacket).coerceAtLeast(0L)
+                rcAgeStatus.text = "Останній RC-пакет: ${age} мс тому"
+                rcAgeStatus.setTextColor(if (age < 500L) accentColor else warningColor)
+            }
+
+            udpCh6Status.text = "CH6 PITCH: ${udpCh6Sent.get()}"
+            udpCh7Status.text = "CH7 ZOOM: ${udpCh7Sent.get()}"
+            udpCh12Status.text = "CH12 CENTER: ${udpCh12Sent.get()}"
+            udpCh13Status.text = "CH13 DOWN: ${udpCh13Sent.get()}"
+
+            for (i in 0 until 16) {
+                channelViews[i].text = "CH${i + 1}: ${channels[i]}"
+            }
+            importantViews[6]?.text =
+                "CH6   Нахил камери / PITCH     ${channels[5]}"
+            importantViews[7]?.text =
+                "CH7   Збільшення / ZOOM          ${channels[6]}"
+            importantViews[12]?.text =
+                "CH12  Центрування камери          ${channels[11]}"
+            importantViews[13]?.text =
+                "CH13  Нахил вниз на 90°           ${channels[12]}"
+
+            mainHandler.postDelayed(this, 20L)
+        }
+    }
 
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).toInt()
@@ -61,9 +138,7 @@ class MainActivity : Activity() {
         return GradientDrawable().apply {
             setColor(color)
             cornerRadius = dp(radiusDp).toFloat()
-            if (strokeColor != null) {
-                setStroke(dp(1), strokeColor)
-            }
+            if (strokeColor != null) setStroke(dp(1), strokeColor)
         }
     }
 
@@ -88,7 +163,6 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(15), dp(16), dp(15))
             background = roundedBackground(cardColor)
         }
-
         val heading = makeText(title, 14f, accentColor, true)
         heading.letterSpacing = 0.06f
         card.addView(heading)
@@ -96,9 +170,7 @@ class MainActivity : Activity() {
         val params = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            topMargin = dp(12)
-        }
+        ).apply { topMargin = dp(12) }
         rootLayout.addView(card, params)
         return card
     }
@@ -172,22 +244,27 @@ class MainActivity : Activity() {
         val limited = speed.coerceIn(-99, 99)
         val encoded = if (limited < 0) 256 + limited else limited
         sendCameraCommand(socket, 'G', "GSP", "%02X".format(encoded))
+        udpCh6Sent.incrementAndGet()
     }
 
     private fun sendCenter(socket: DatagramSocket) {
         sendCameraCommand(socket, 'G', "PTZ", "05")
+        udpCh12Sent.incrementAndGet()
     }
 
     private fun sendDown(socket: DatagramSocket) {
         sendCameraCommand(socket, 'G', "PTZ", "02")
+        udpCh13Sent.incrementAndGet()
     }
 
     private fun sendZoomIn(socket: DatagramSocket) {
         sendCameraCommand(socket, 'D', "DZM", "0A")
+        udpCh7Sent.incrementAndGet()
     }
 
     private fun sendZoomOut(socket: DatagramSocket) {
         sendCameraCommand(socket, 'D', "DZM", "0B")
+        udpCh7Sent.incrementAndGet()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -220,7 +297,15 @@ class MainActivity : Activity() {
         val statusCard = addCard("СТАН СИСТЕМИ")
         uartStatus = addStatusLine(statusCard, "●  SIYI UART: підключення...")
         networkStatus = addStatusLine(statusCard, "●  Мережа C12: перевірка...")
-        udpStatus = addStatusLine(statusCard, "●  UDP C12: очікування...")
+        udpStatus = addStatusLine(statusCard, "●  UDP C12: запуск циклу 50 Гц...")
+        uartRateStatus = addStatusLine(statusCard, "UART: 0 пакетів/с")
+        rcAgeStatus = addStatusLine(statusCard, "Останній RC-пакет: ще не отримано")
+
+        val diagnosticsCard = addCard("ЛІЧИЛЬНИКИ UDP-КОМАНД")
+        udpCh6Status = addStatusLine(diagnosticsCard, "CH6 PITCH: 0")
+        udpCh7Status = addStatusLine(diagnosticsCard, "CH7 ZOOM: 0")
+        udpCh12Status = addStatusLine(diagnosticsCard, "CH12 CENTER: 0")
+        udpCh13Status = addStatusLine(diagnosticsCard, "CH13 DOWN: 0")
 
         val controlsCard = addCard("ОСНОВНІ КАНАЛИ")
         val controls = listOf(
@@ -233,12 +318,13 @@ class MainActivity : Activity() {
             val value = addChannelValue(controlsCard, "$label     ---")
             importantViews[channel] = value
             if (channel != 13) {
-                val divider = View(this).apply {
-                    setBackgroundColor(0x334B6078)
-                }
-                controlsCard.addView(divider, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, dp(1)
-                ))
+                val divider = View(this).apply { setBackgroundColor(0x334B6078) }
+                controlsCard.addView(
+                    divider,
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, dp(1)
+                    )
+                )
             }
         }
 
@@ -251,27 +337,42 @@ class MainActivity : Activity() {
             for (column in 0..1) {
                 val index = row * 2 + column
                 val channel = index + 1
-                val view = makeText("CH$channel: ---", 14f, primaryColor, channel == 6 || channel == 7 || channel == 12 || channel == 13)
+                val view = makeText(
+                    "CH$channel: ---",
+                    14f,
+                    primaryColor,
+                    channel == 6 || channel == 7 || channel == 12 || channel == 13
+                )
                 view.setPadding(0, dp(9), 0, dp(9))
-                rowLayout.addView(view, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                rowLayout.addView(
+                    view,
+                    LinearLayout.LayoutParams(
+                        0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+                    )
+                )
                 channelViews.add(view)
             }
             allChannelsCard.addView(rowLayout)
         }
 
-        val footer = makeText("Версія 1.1.0  •  UART 115200  •  C12 UDP 5000", 12f, secondaryColor)
+        val footer = makeText(
+            "Версія 1.2.0  •  UART 115200  •  керування 50 Гц  •  C12 UDP 5000",
+            12f,
+            secondaryColor
+        )
         footer.gravity = Gravity.CENTER
         footer.setPadding(0, dp(18), 0, dp(5))
         rootLayout.addView(footer)
 
         running = true
+        mainHandler.post(uiRefresh)
         startNetworkCheck()
         startUart()
         startCameraControl()
     }
 
     private fun startNetworkCheck() {
-        Thread {
+        Thread({
             try {
                 Socket().use { socket ->
                     socket.connect(InetSocketAddress(cameraIp, 554), 2500)
@@ -282,16 +383,20 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {
                 runOnUiThread {
-                    networkStatus.text = "●  Мережа C12: немає TCP-з'єднання (${e.javaClass.simpleName})"
+                    networkStatus.text =
+                        "●  Мережа C12: немає TCP-з'єднання (${e.javaClass.simpleName})"
                     networkStatus.setTextColor(warningColor)
                 }
             }
-        }.start()
+        }, "C12-Network-Check").start()
     }
 
+    // Окремий потік: тільки читання/розбір UART. Інтерфейс тут не оновлюється.
     private fun startUart() {
-        Thread {
+        Thread({
             try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+
                 val config = ProcessBuilder(
                     "/system/bin/stty", "-F", "/dev/ttyHS3",
                     "115200", "raw", "-echo"
@@ -316,42 +421,45 @@ class MainActivity : Activity() {
                             Thread.sleep(50)
                         }
 
-                        val buffer = ArrayList<Byte>()
-                        var validPackets = 0
-                        var lastUpdate = 0L
+                        val buffer = ArrayList<Byte>(512)
 
-                        while (running) {
+                        while (running && !Thread.currentThread().isInterrupted) {
                             val available = input.available()
                             if (available > 0) {
-                                repeat(minOf(available, 256)) {
+                                repeat(minOf(available, 512)) {
                                     val b = input.read()
                                     if (b >= 0) buffer.add(b.toByte())
                                 }
                             } else {
-                                Thread.sleep(5)
+                                // Коротке очікування; потік не блокує цикл керування UDP.
+                                Thread.sleep(1)
                             }
 
-                            while (buffer.size >= 8) {
+                            while (buffer.size >= 10) {
                                 var header = -1
                                 for (i in 0 until buffer.size - 1) {
                                     if ((buffer[i].toInt() and 0xFF) == 0x55 &&
-                                        (buffer[i + 1].toInt() and 0xFF) == 0x66) {
+                                        (buffer[i + 1].toInt() and 0xFF) == 0x66
+                                    ) {
                                         header = i
                                         break
                                     }
                                 }
 
                                 if (header < 0) {
-                                    val keepLast = (buffer.last().toInt() and 0xFF) == 0x55
+                                    val keepLast =
+                                        (buffer.last().toInt() and 0xFF) == 0x55
                                     buffer.clear()
                                     if (keepLast) buffer.add(0x55.toByte())
                                     break
                                 }
                                 if (header > 0) repeat(header) { buffer.removeAt(0) }
-                                if (buffer.size < 8) break
+                                if (buffer.size < 10) break
 
-                                val dataLength = (buffer[3].toInt() and 0xFF) or
+                                val dataLength =
+                                    (buffer[3].toInt() and 0xFF) or
                                     ((buffer[4].toInt() and 0xFF) shl 8)
+
                                 if (dataLength > 512) {
                                     buffer.removeAt(0)
                                     continue
@@ -359,11 +467,14 @@ class MainActivity : Activity() {
 
                                 val totalLength = 10 + dataLength
                                 if (buffer.size < totalLength) break
+
                                 val packet = ByteArray(totalLength)
                                 for (i in 0 until totalLength) packet[i] = buffer[i]
 
-                                val receivedCrc = (packet[totalLength - 2].toInt() and 0xFF) or
+                                val receivedCrc =
+                                    (packet[totalLength - 2].toInt() and 0xFF) or
                                     ((packet[totalLength - 1].toInt() and 0xFF) shl 8)
+
                                 if (receivedCrc != crc16(packet, totalLength - 2)) {
                                     buffer.removeAt(0)
                                     continue
@@ -374,34 +485,19 @@ class MainActivity : Activity() {
                                     val channels = IntArray(16)
                                     for (i in 0 until 16) {
                                         val position = 8 + i * 2
-                                        channels[i] = (packet[position].toInt() and 0xFF) or
+                                        channels[i] =
+                                            (packet[position].toInt() and 0xFF) or
                                             ((packet[position + 1].toInt() and 0xFF) shl 8)
                                     }
 
                                     latestChannels = channels
-                                    lastRcPacketMs = System.currentTimeMillis()
-                                    validPackets++
-                                    val now = System.currentTimeMillis()
-
-                                    if (now - lastUpdate >= 100) {
-                                        lastUpdate = now
-                                        runOnUiThread {
-                                            if (!running) return@runOnUiThread
-                                            uartStatus.text = "●  SIYI UART: ЗВ'ЯЗОК Є  •  CRC OK  •  $validPackets пакетів"
-                                            uartStatus.setTextColor(accentColor)
-
-                                            for (i in 0 until 16) {
-                                                channelViews[i].text = "CH${i + 1}: ${channels[i]}"
-                                            }
-                                            importantViews[6]?.text = "CH6   Нахил камери / PITCH     ${channels[5]}"
-                                            importantViews[7]?.text = "CH7   Збільшення / ZOOM          ${channels[6]}"
-                                            importantViews[12]?.text = "CH12  Центрування камери          ${channels[11]}"
-                                            importantViews[13]?.text = "CH13  Нахил вниз на 90°           ${channels[12]}"
-                                        }
-                                    }
+                                    lastRcPacketMs.set(SystemClock.elapsedRealtime())
+                                    uartPacketsTotal.incrementAndGet()
                                 }
+
                                 repeat(totalLength) { buffer.removeAt(0) }
                             }
+
                             if (buffer.size > 2048) buffer.clear()
                         }
                     }
@@ -409,23 +505,30 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 if (running) {
                     runOnUiThread {
-                        uartStatus.text = "●  ПОМИЛКА UART: ${e.javaClass.simpleName} — ${e.message}"
+                        uartStatus.text =
+                            "●  ПОМИЛКА UART: ${e.javaClass.simpleName} — ${e.message}"
                         uartStatus.setTextColor(warningColor)
                     }
                 }
             }
-        }.start()
+        }, "SIYI-UART-Reader").start()
     }
 
+    // Окремий незалежний цикл UDP з періодом 20 мс (50 Гц).
     private fun startCameraControl() {
-        Thread {
+        Thread({
             var socket: DatagramSocket? = null
             try {
-                socket = DatagramSocket(cameraPort)
-                socket.soTimeout = 100
+                Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
+
+                // Ефемерний локальний порт: не займаємо локальний UDP 5000.
+                val udpSocket = DatagramSocket()
+                socket = udpSocket
+                udpSocket.soTimeout = 100
 
                 runOnUiThread {
-                    udpStatus.text = "●  UDP C12: локальний порт 5000 відкритий; камера $cameraIp:5000"
+                    udpStatus.text =
+                        "●  UDP C12: цикл керування 50 Гц; призначення $cameraIp:5000"
                     udpStatus.setTextColor(accentColor)
                 }
 
@@ -435,86 +538,93 @@ class MainActivity : Activity() {
                 var downPressed = false
                 var lastStaleStop = false
 
-                while (running) {
-                    val now = System.currentTimeMillis()
+                val periodNs = 20_000_000L
+                var nextTick = SystemClock.elapsedRealtimeNanos()
+
+                while (running && !Thread.currentThread().isInterrupted) {
+                    val nowMs = SystemClock.elapsedRealtime()
                     val channels = latestChannels
-                    val rcFresh = now - lastRcPacketMs < 500 && lastRcPacketMs > 0
+                    val lastPacketMs = lastRcPacketMs.get()
+                    val rcFresh = lastPacketMs > 0L && nowMs - lastPacketMs < 500L
 
                     if (!rcFresh) {
                         if (lastPitchSpeed != 0) {
-                            sendPitchSpeed(socket, 0)
+                            sendPitchSpeed(udpSocket, 0)
                             lastPitchSpeed = 0
                         }
                         if (!lastStaleStop) {
                             runOnUiThread {
-                                udpStatus.text = "●  UDP C12: очікування сигналу пульта — рух зупинено"
+                                udpStatus.text =
+                                    "●  UDP C12: немає свіжого RC — рух зупинено"
                                 udpStatus.setTextColor(warningColor)
                             }
                             lastStaleStop = true
                         }
-                        Thread.sleep(100)
-                        continue
-                    }
-                    lastStaleStop = false
-
-                    // CH6 PITCH: швидкість збільшена вдвічі.
-                    // Було ±20, стало ±40; за шкалою GSP це приблизно до 4°/с.
-                    val pitchDifference = channels[5] - 1500
-                    val pitchSpeed = if (abs(pitchDifference) <= 30) {
-                        0
+                        centerPressed = false
+                        downPressed = false
                     } else {
-                        (pitchDifference * 40 / 450).coerceIn(-40, 40)
-                    }
+                        lastStaleStop = false
 
-                    if (pitchSpeed != 0 || lastPitchSpeed != 0) {
-                        sendPitchSpeed(socket, pitchSpeed)
-                        lastPitchSpeed = pitchSpeed
-                    }
+                        // CH6: швидкість нахилу; GSP передається кожні 20 мс,
+                        // поки стік відхилений, а також один раз для зупинки.
+                        val pitchDifference = channels[5] - 1500
+                        val pitchSpeed = if (abs(pitchDifference) <= 30) {
+                            0
+                        } else {
+                            (pitchDifference * 40 / 450).coerceIn(-40, 40)
+                        }
 
-                    // CH7 ZOOM: інтервал між кроками зменшений удвічі: 350 -> 175 мс.
-                    val zoomPwm = channels[6]
-                    if (now - lastZoomTime >= 175) {
-                        when {
-                            zoomPwm > 1600 -> {
-                                sendZoomIn(socket)
-                                lastZoomTime = now
+                        if (pitchSpeed != 0 || lastPitchSpeed != 0) {
+                            sendPitchSpeed(udpSocket, pitchSpeed)
+                            lastPitchSpeed = pitchSpeed
+                        }
+
+                        // CH7: дискретні кроки zoom, частота кроків 175 мс.
+                        if (nowMs - lastZoomTime >= 175L) {
+                            when {
+                                channels[6] > 1600 -> {
+                                    sendZoomIn(udpSocket)
+                                    lastZoomTime = nowMs
+                                }
+                                channels[6] < 1400 -> {
+                                    sendZoomOut(udpSocket)
+                                    lastZoomTime = nowMs
+                                }
                             }
-                            zoomPwm < 1400 -> {
-                                sendZoomOut(socket)
-                                lastZoomTime = now
-                            }
                         }
+
+                        val centerNow = channels[11] > 1700
+                        if (centerNow && !centerPressed) {
+                            sendPitchSpeed(udpSocket, 0)
+                            lastPitchSpeed = 0
+                            sendCenter(udpSocket)
+                        }
+                        centerPressed = centerNow
+
+                        val downNow = channels[12] > 1700
+                        if (downNow && !downPressed) {
+                            sendPitchSpeed(udpSocket, 0)
+                            lastPitchSpeed = 0
+                            sendDown(udpSocket)
+                        }
+                        downPressed = downNow
                     }
 
-                    val centerNow = channels[11] > 1700
-                    if (centerNow && !centerPressed) {
-                        sendPitchSpeed(socket, 0)
-                        lastPitchSpeed = 0
-                        sendCenter(socket)
-                        runOnUiThread {
-                            udpStatus.text = "●  UDP C12: команда центрування CH12 надіслана"
-                            udpStatus.setTextColor(accentColor)
-                        }
+                    // Абсолютне планування періоду зменшує накопичення похибки sleep().
+                    nextTick += periodNs
+                    val remaining = nextTick - SystemClock.elapsedRealtimeNanos()
+                    if (remaining > 0L) {
+                        LockSupport.parkNanos(remaining)
+                    } else {
+                        // Якщо система не встигла, не намагаємося надолужувати серією пакетів.
+                        nextTick = SystemClock.elapsedRealtimeNanos()
                     }
-                    centerPressed = centerNow
-
-                    val downNow = channels[12] > 1700
-                    if (downNow && !downPressed) {
-                        sendPitchSpeed(socket, 0)
-                        lastPitchSpeed = 0
-                        sendDown(socket)
-                        runOnUiThread {
-                            udpStatus.text = "●  UDP C12: команда нахилу вниз CH13 надіслана"
-                            udpStatus.setTextColor(accentColor)
-                        }
-                    }
-                    downPressed = downNow
-                    Thread.sleep(100)
                 }
             } catch (e: Exception) {
                 if (running) {
                     runOnUiThread {
-                        udpStatus.text = "●  ПОМИЛКА UDP: ${e.javaClass.simpleName} — ${e.message}"
+                        udpStatus.text =
+                            "●  ПОМИЛКА UDP: ${e.javaClass.simpleName} — ${e.message}"
                         udpStatus.setTextColor(warningColor)
                     }
                 }
@@ -529,11 +639,12 @@ class MainActivity : Activity() {
                 } catch (_: Exception) {
                 }
             }
-        }.start()
+        }, "C12-UDP-Control-50Hz").start()
     }
 
     override fun onDestroy() {
         running = false
+        mainHandler.removeCallbacks(uiRefresh)
         super.onDestroy()
     }
 }
