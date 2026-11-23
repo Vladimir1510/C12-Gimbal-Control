@@ -93,6 +93,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
         override fun onServiceDisconnected(name: ComponentName) {
             rcService = null
+            channelsReceived = false
             logEvent("RC SERVICE відключився (процес UniGCS зупинено?)")
             if (c12 != null && lastPitchSpeed != 0) {
                 lastPitchSpeed = 0
@@ -105,71 +106,255 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         super.onCreate(savedInstanceState)
         inputManager = getSystemService(Context.INPUT_SERVICE) as InputManager
 
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(18, 18, 18, 18)
-        }
-        val title = TextView(this).apply {
-            text = "UniRC 7 → C12 контролер\nUART не відкривається. Команди C12 — лише коли контролер увімкнено."
-            textSize = 18f
-        }
-        root.addView(title)
-
-        val refresh = Button(this).apply {
-            text = "Оновити список пристроїв і служб"
-            setOnClickListener { runFullScan() }
-        }
-        root.addView(refresh)
-
-        val clear = Button(this).apply {
-            text = "Очистити журнал подій"
-            setOnClickListener {
-                events.clear()
-                lastAxisValues.clear()
-                logEvent("Журнал очищено")
-            }
-        }
-        root.addView(clear)
-
-        val copy = Button(this).apply {
-            text = "Скопіювати звіт"
-            setOnClickListener {
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("UniRC diagnostics", buildReport()))
-                logEvent("Звіт скопійовано в буфер обміну")
-            }
-        }
-        root.addView(copy)
-
-        val rcProbe = Button(this).apply {
-            text = "Проба UniGCS: підписатися на канали"
-            setOnClickListener { if (rcBound) stopRcProbe() else startRcProbe() }
-        }
-        root.addView(rcProbe)
-
-        val controller = Button(this).apply {
-            text = "Контролер C12: увімкнути"
-            setOnClickListener {
-                if (c12 == null) startController() else stopController()
-                text = if (c12 == null) "Контролер C12: увімкнути" else "Контролер C12: ВИМКНУТИ"
-            }
-        }
-        root.addView(controller)
-
-        output = TextView(this).apply {
-            textSize = 12f
-            typeface = android.graphics.Typeface.MONOSPACE
-            setTextIsSelectable(true)
-        }
-        scroll = ScrollView(this)
-        scroll.addView(output)
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        setContentView(root)
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setContentView(buildUi())
 
         inputManager.registerInputDeviceListener(this, null)
         runFullScan()
-        logEvent("ТЕСТ ПОДІЙ: залиш цей екран відкритим і рухай CH6/CH7, натискай CH12/CH13.")
-        logEvent("Події, які Android доставить саме цьому застосунку, з'являться нижче.")
+        // Subscribe to RC channels right away so the live indicators work; gimbal commands start only with the toggle.
+        startRcProbe()
+        handler.post(statusTask)
+    }
+
+    // ---------- UI ----------
+
+    private lateinit var rcStatus: TextView
+    private lateinit var camStatus: TextView
+    private lateinit var toggleButton: Button
+    private lateinit var centerButton: Button
+    private lateinit var downButton: Button
+    private lateinit var pitchBar: android.widget.ProgressBar
+    private lateinit var pitchLabel: TextView
+    private lateinit var zoomBar: android.widget.ProgressBar
+    private lateinit var zoomLabel: TextView
+    private lateinit var lastCommand: TextView
+    private lateinit var hint: TextView
+    private lateinit var diagnostics: LinearLayout
+    private var channelsReceived = false
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun label(text: String, size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+        this.text = text
+        textSize = size
+        setTextColor(color)
+        if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+    }
+
+    private fun rounded(color: Int, radius: Int = 14) = android.graphics.drawable.GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(radius).toFloat()
+    }
+
+    private fun card(vararg children: View) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = rounded(COLOR_CARD)
+        setPadding(dp(16), dp(12), dp(16), dp(12))
+        children.forEach { addView(it) }
+    }
+
+    private fun bigButton(text: String, color: Int, onClick: () -> Unit) = Button(this).apply {
+        this.text = text
+        textSize = 18f
+        setTextColor(COLOR_TEXT)
+        isAllCaps = false
+        background = rounded(color)
+        setOnClickListener { onClick() }
+    }
+
+    private fun bar() = android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+        max = WHEEL_SPAN * 2
+        progress = WHEEL_SPAN
+        progressTintList = android.content.res.ColorStateList.valueOf(COLOR_ACCENT)
+    }
+
+    private fun spaced(view: View, top: Int = 10, weight: Float = 0f, width: Int = -1, height: Int = -2) =
+        view.apply {
+            layoutParams = LinearLayout.LayoutParams(if (weight > 0f) 0 else width, height, weight).apply { topMargin = dp(top) }
+        }
+
+    private fun buildUi(): View {
+        rcStatus = label("", 15f, COLOR_TEXT, bold = true).apply { setPadding(dp(14), dp(8), dp(14), dp(8)) }
+        camStatus = label("", 15f, COLOR_TEXT, bold = true).apply { setPadding(dp(14), dp(8), dp(14), dp(8)) }
+        val statusRow = LinearLayout(this).apply {
+            addView(spaced(rcStatus, 0, 1f))
+            addView(spaced(camStatus, 0, 1f).apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(10) })
+        }
+
+        toggleButton = bigButton("", COLOR_OK) {
+            if (c12 == null) startController() else stopController()
+            refreshStatus()
+        }
+        centerButton = bigButton("⊙  Центр", COLOR_BUTTON) { manualCommand(C12Protocol.center(), "центр (екран)") }
+        downButton = bigButton("↓  Вниз 90°", COLOR_BUTTON) { manualCommand(C12Protocol.pitchAbsolute(-90, DOWN90_SPEED), "вниз 90° (екран)") }
+        val quickRow = LinearLayout(this).apply {
+            addView(spaced(centerButton, 0, 1f, height = dp(64)))
+            addView(spaced(downButton, 0, 1f, height = dp(64)).apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(10) })
+        }
+
+        pitchBar = bar()
+        pitchLabel = label("Нахил: —", 16f, COLOR_TEXT)
+        zoomBar = bar()
+        zoomLabel = label("Зум: —", 16f, COLOR_TEXT)
+        lastCommand = label("Остання команда: —", 13f, COLOR_MUTED)
+        val live = card(pitchLabel, spaced(pitchBar, 4), spaced(zoomLabel, 12), spaced(zoomBar, 4), spaced(lastCommand, 12))
+
+        val legend = card(
+            label("Керування з пульта", 15f, COLOR_TEXT, bold = true),
+            spaced(label("Колесо CH6 — нахил камери\nКолесо CH11 — зум\nКнопка CH12 — центр\nКнопка CH13 — вниз 90°", 14f, COLOR_MUTED), 6),
+        )
+
+        hint = label("", 14f, COLOR_WARN).apply { visibility = View.GONE }
+
+        val left = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(label("C12 Gimbal", 26f, COLOR_TEXT, bold = true))
+            addView(spaced(statusRow, 12))
+            addView(spaced(hint, 8))
+            addView(spaced(toggleButton, 14, height = dp(76)))
+            addView(spaced(quickRow, 12))
+            addView(spaced(live, 12))
+        }
+        val right = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(legend)
+        }
+        val main = LinearLayout(this).apply {
+            addView(spaced(left, 0, 1f))
+            addView(spaced(right, 0, 1f).apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(16) })
+        }
+
+        diagnostics = buildDiagnostics().apply { visibility = View.GONE }
+        val diagToggle = label("▸  Діагностика", 15f, COLOR_MUTED).apply {
+            setPadding(0, dp(14), 0, dp(6))
+            setOnClickListener {
+                val show = diagnostics.visibility != View.VISIBLE
+                diagnostics.visibility = if (show) View.VISIBLE else View.GONE
+                text = if (show) "▾  Діагностика" else "▸  Діагностика"
+                if (show) scheduleRender()
+            }
+        }
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(20))
+            addView(main)
+            addView(diagToggle)
+            addView(diagnostics)
+        }
+        return ScrollView(this).apply {
+            setBackgroundColor(COLOR_BG)
+            isFillViewport = true
+            addView(content)
+        }.also { refreshStatus() }
+    }
+
+    private fun buildDiagnostics(): LinearLayout {
+        fun small(text: String, onClick: () -> Unit) = Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            setTextColor(COLOR_TEXT)
+            background = rounded(COLOR_BUTTON, 10)
+            setOnClickListener { onClick() }
+        }
+        val buttons = LinearLayout(this).apply {
+            addView(spaced(small("Оновити сканування") { runFullScan() }, 0, 1f))
+            addView(spaced(small("Очистити журнал") {
+                events.clear()
+                lastAxisValues.clear()
+                logEvent("Журнал очищено")
+            }, 0, 1f).apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(8) })
+            addView(spaced(small("Скопіювати звіт") {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("UniRC diagnostics", buildReport()))
+                logEvent("Звіт скопійовано в буфер обміну")
+            }, 0, 1f).apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(8) })
+        }
+        output = TextView(this).apply {
+            textSize = 12f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextColor(COLOR_MUTED)
+            setTextIsSelectable(true)
+        }
+        scroll = ScrollView(this).apply {
+            background = rounded(COLOR_CARD, 10)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            addView(output)
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(buttons)
+            addView(spaced(scroll, 8, height = dp(360)))
+        }
+    }
+
+    private fun refreshStatus() {
+        if (!::toggleButton.isInitialized) return
+        val rcOk = rcService != null && channelsReceived
+        rcStatus.text = if (rcOk) "●  Пульт: підключено" else "●  Пульт: очікування…"
+        rcStatus.background = rounded(if (rcOk) COLOR_OK_DIM else COLOR_WARN_DIM, 20)
+        rcStatus.setTextColor(if (rcOk) COLOR_OK_TEXT else COLOR_WARN)
+
+        val camNet = cameraNetworkUp()
+        camStatus.text = if (camNet) "●  Мережа камери: є" else "●  Мережа камери: немає"
+        camStatus.background = rounded(if (camNet) COLOR_OK_DIM else COLOR_WARN_DIM, 20)
+        camStatus.setTextColor(if (camNet) COLOR_OK_TEXT else COLOR_WARN)
+
+        val hintText = when {
+            !camNet -> "Немає мережі камери (usb0). Перевірте, що дрон увімкнено, і від'єднайте USB-кабель пульта від комп'ютера."
+            !rcOk -> "Немає даних з пульта. Переконайтеся, що застосунок UniGCS встановлено."
+            else -> ""
+        }
+        hint.text = hintText
+        hint.visibility = if (hintText.isEmpty()) View.GONE else View.VISIBLE
+
+        val active = c12 != null
+        toggleButton.text = if (active) "■  Вимкнути керування" else "▶  Увімкнути керування"
+        toggleButton.background = rounded(if (active) COLOR_STOP else COLOR_OK)
+        listOf(centerButton, downButton).forEach {
+            it.isEnabled = active
+            it.alpha = if (active) 1f else 0.4f
+        }
+    }
+
+    private fun cameraNetworkUp(): Boolean = try {
+        java.net.NetworkInterface.getByName(CAMERA_INTERFACE)?.isUp == true
+    } catch (_: Exception) {
+        false
+    }
+
+    private val statusTask = object : Runnable {
+        override fun run() {
+            refreshStatus()
+            handler.postDelayed(this, STATUS_INTERVAL_MS)
+        }
+    }
+
+    private fun manualCommand(command: String, what: String) {
+        if (c12 == null) return
+        lastPitchSpeed = 0
+        sendC12(command, what)
+    }
+
+    private fun updateLive(ch: Map<String, Int>) {
+        if (!::pitchBar.isInitialized) return
+        ch[CH_PITCH]?.let { v ->
+            pitchBar.progress = (v - WHEEL_CENTER + WHEEL_SPAN).coerceIn(0, WHEEL_SPAN * 2)
+            val speed = wheelToSpeed(v, MAX_PITCH_SPEED)
+            pitchLabel.text = "Нахил: " + when {
+                speed > 0 -> "вгору, швидкість $speed"
+                speed < 0 -> "вниз, швидкість ${-speed}"
+                else -> "стоїть"
+            }
+        }
+        ch[CH_ZOOM]?.let { v ->
+            zoomBar.progress = (v - WHEEL_CENTER + WHEEL_SPAN).coerceIn(0, WHEEL_SPAN * 2)
+            zoomLabel.text = "Зум: " + when (wheelToSpeed(v, 1)) {
+                1 -> "збільшення"
+                -1 -> "зменшення"
+                else -> "без змін"
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -393,7 +578,15 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             }
         }
         if (changed.isNotEmpty()) logEvent("RC CHANNELS code=$code n=${channels.size}:$changed")
-        if (code == RC_CB_CHANNELS_B && c12 != null) controlGimbal(channels.toMap())
+        if (code == RC_CB_CHANNELS_B) {
+            val map = channels.toMap()
+            if (!channelsReceived) {
+                channelsReceived = true
+                refreshStatus()
+            }
+            updateLive(map)
+            if (c12 != null) controlGimbal(map)
+        }
     }
 
     private fun startController() {
@@ -420,6 +613,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     private fun sendC12(command: String, what: String) {
         c12?.send(command)
         logEvent("C12 → $what: $command")
+        if (::lastCommand.isInitialized) lastCommand.text = "Остання команда: $what  ·  ${timeFormat.format(Date())}"
     }
 
     private fun controlGimbal(ch: Map<String, Int>) {
@@ -554,6 +748,21 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         const val MAX_PITCH_SPEED = 25
         const val DOWN90_SPEED = 20
         const val WATCHDOG_INTERVAL_MS = 200L
+        const val STATUS_INTERVAL_MS = 1000L
+        const val CAMERA_INTERFACE = "usb0"
+
+        val COLOR_BG = android.graphics.Color.parseColor("#12161C")
+        val COLOR_CARD = android.graphics.Color.parseColor("#1E242D")
+        val COLOR_BUTTON = android.graphics.Color.parseColor("#2C3440")
+        val COLOR_TEXT = android.graphics.Color.parseColor("#F2F4F7")
+        val COLOR_MUTED = android.graphics.Color.parseColor("#9AA4B2")
+        val COLOR_ACCENT = android.graphics.Color.parseColor("#4DA3FF")
+        val COLOR_OK = android.graphics.Color.parseColor("#1F8A4C")
+        val COLOR_OK_TEXT = android.graphics.Color.parseColor("#6EE7A0")
+        val COLOR_OK_DIM = android.graphics.Color.parseColor("#1B3A2A")
+        val COLOR_WARN = android.graphics.Color.parseColor("#F5B841")
+        val COLOR_WARN_DIM = android.graphics.Color.parseColor("#3D3220")
+        val COLOR_STOP = android.graphics.Color.parseColor("#B3261E")
         const val ZOOM_STEP_MS = 175L
     }
 }
