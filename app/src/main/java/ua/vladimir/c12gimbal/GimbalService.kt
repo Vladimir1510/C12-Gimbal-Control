@@ -487,7 +487,7 @@ class GimbalService : Service() {
 
         // Controller mapping (values seen on hardware: 1050..1950, centre 1500).
         const val CH_PITCH = "CHANNEL_6"
-        const val CH_ZOOM = "CHANNEL_11"
+        const val CH_ZOOM = "CHANNEL_7"
         const val CH_CENTER = "CHANNEL_12"
         const val CH_DOWN90 = "CHANNEL_13"
         const val WHEEL_CENTER = 1500
