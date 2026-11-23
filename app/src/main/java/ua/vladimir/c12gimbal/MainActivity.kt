@@ -23,7 +23,7 @@ import java.util.Locale
  * Read-only diagnostics for UniRC 7.
  * IMPORTANT: This Activity does not open UART, create UDP sockets, or send commands.
  */
-class DiagnosticsActivity : Activity(), InputManager.InputDeviceListener {
+class MainActivity : Activity(), InputManager.InputDeviceListener {
     private lateinit var output: TextView
     private lateinit var inputManager: InputManager
     private val log = StringBuilder()
