@@ -201,7 +201,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
         val legend = card(
             label("Керування з пульта", 15f, COLOR_TEXT, bold = true),
-            spaced(label("Колесо CH6 — нахил камери\nКолесо CH11 — зум\nКнопка CH12 — центр\nКнопка CH13 — вниз 90°", 14f, COLOR_MUTED), 6),
+            spaced(label("Колесо CH6 — нахил камери\nКолесо CH7 — зум\nКнопка CH12 — центр\nКнопка CH13 — вниз 90°", 14f, COLOR_MUTED), 6),
         )
 
         hint = label("", 14f, COLOR_WARN).apply { visibility = View.GONE }
@@ -739,7 +739,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
         // Controller mapping (values seen on hardware: 1050..1950, centre 1500).
         const val CH_PITCH = "CHANNEL_6"
-        const val CH_ZOOM = "CHANNEL_11"
+        const val CH_ZOOM = "CHANNEL_7"
         const val CH_CENTER = "CHANNEL_12"
         const val CH_DOWN90 = "CHANNEL_13"
         const val WHEEL_CENTER = 1500
