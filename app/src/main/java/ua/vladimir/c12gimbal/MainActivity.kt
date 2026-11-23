@@ -112,16 +112,37 @@ class DiagnosticsActivity : Activity(), InputManager.InputDeviceListener {
     }
 
     private fun scanSystemServiceNames() {
-        append("\n[ANDROID SYSTEM SERVICE NAMES]")
-        val names = try { getSystemServiceNames().sorted() } catch (e: Exception) {
-            append("Не вдалося отримати назви системних сервісів: ${e.message}")
-            emptyList()
+        append("\n[ANDROID SYSTEM SERVICES]")
+    
+        val services = listOf(
+            "INPUT_SERVICE" to Context.INPUT_SERVICE,
+            "WINDOW_SERVICE" to Context.WINDOW_SERVICE,
+            "USB_SERVICE" to Context.USB_SERVICE,
+            "AUDIO_SERVICE" to Context.AUDIO_SERVICE,
+            "BLUETOOTH_SERVICE" to Context.BLUETOOTH_SERVICE,
+            "WIFI_SERVICE" to Context.WIFI_SERVICE,
+            "SENSOR_SERVICE" to Context.SENSOR_SERVICE,
+            "ACTIVITY_SERVICE" to Context.ACTIVITY_SERVICE,
+            "PACKAGE_SERVICE" to Context.POWER_SERVICE
+        )
+    
+        for ((name, serviceName) in services) {
+            try {
+                val service = getSystemService(serviceName)
+                append(
+                    "$name: " +
+                    if (service != null) service.javaClass.name
+                    else "недоступний"
+                )
+            } catch (e: Exception) {
+                append("$name: помилка ${e.message}")
+            }
         }
-        append("Доступних назв системних сервісів: ${names.size}")
-        val filtered = names.filter { it.contains("input", true) || it.contains("hid", true) || it.contains("radio", true) || it.contains("siyi", true) || it.contains("skydroid", true) || it.contains("rc", true) }
-        append("Назви, схожі на input/HID/RC/SIYI:")
-        if (filtered.isEmpty()) append("  (збігів немає)") else filtered.forEach { append("  $it") }
-        append("Примітка: це назви системних API, а не список усіх запущених процесів.")
+    
+        append(
+            "Примітка: перевірені доступні Android API. " +
+            "Це не повний список внутрішніх системних служб UniRC."
+        )
     }
 
     @Suppress("DEPRECATION")
