@@ -57,7 +57,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     // Gimbal controller: RC channels (via the probe above) -> C12 UDP commands.
     private var c12: C12Client? = null
     private var lastPitchSpeed = 0
-    private var zoomWarned = false
+    private var zoomDirection = 0
     private val buttonPressed = HashMap<String, Boolean>()
 
     /**
@@ -400,15 +400,17 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         c12 = C12Client(onError = { msg -> handler.post { logEvent(msg) } })
         lastPitchSpeed = 0
         buttonPressed.clear()
-        zoomWarned = false
+        zoomDirection = 0
         if (!rcBound) startRcProbe()
         handler.postDelayed(watchdogTask, WATCHDOG_INTERVAL_MS)
-        logEvent("CONTROLLER увімкнено: $CH_PITCH=нахил, $CH_CENTER=центр, $CH_DOWN90=вниз 90°, $CH_ZOOM=зум (не підтримується)")
+        logEvent("CONTROLLER увімкнено: $CH_PITCH=нахил, $CH_CENTER=центр, $CH_DOWN90=вниз 90°, $CH_ZOOM=зум")
     }
 
     private fun stopController() {
         val client = c12 ?: return
         handler.removeCallbacks(watchdogTask)
+        handler.removeCallbacks(zoomTask)
+        zoomDirection = 0
         client.send(C12Protocol.stop())
         client.close()
         c12 = null
@@ -436,11 +438,14 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             lastPitchSpeed = 0
             sendC12(C12Protocol.pitchAbsolute(-90, DOWN90_SPEED), "вниз 90°")
         }
-        // Zoom command for C12 is not known yet (needs camera manual/SDK), so only warn once.
-        val zoom = ch[CH_ZOOM]
-        if (zoom != null && wheelToSpeed(zoom, 1) != 0 && !zoomWarned) {
-            zoomWarned = true
-            logEvent("ZOOM: $CH_ZOOM рухається, але команда зуму C12 ще не відома — нічого не надіслано")
+        ch[CH_ZOOM]?.let { value ->
+            val direction = wheelToSpeed(value, 1)
+            if (direction != zoomDirection) {
+                zoomDirection = direction
+                logEvent("ZOOM ${when (direction) { 1 -> "збільшення"; -1 -> "зменшення"; else -> "стоп" }}")
+                handler.removeCallbacks(zoomTask)
+                if (direction != 0) handler.post(zoomTask)
+            }
         }
     }
 
@@ -458,6 +463,16 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         val pressed = value > WHEEL_CENTER
         val was = buttonPressed.put(channel, pressed) ?: pressed
         return pressed && !was
+    }
+
+    // Zoom is step-based: one step every ZOOM_STEP_MS while the wheel is off-centre.
+    private val zoomTask = object : Runnable {
+        override fun run() {
+            val client = c12 ?: return
+            if (zoomDirection == 0 || rcService == null) return
+            client.send(if (zoomDirection > 0) C12Protocol.zoomIn() else C12Protocol.zoomOut())
+            handler.postDelayed(this, ZOOM_STEP_MS)
+        }
     }
 
     // The service sends channel frames only on change, so a held wheel produces no frames:
@@ -539,5 +554,6 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         const val MAX_PITCH_SPEED = 25
         const val DOWN90_SPEED = 20
         const val WATCHDOG_INTERVAL_MS = 200L
+        const val ZOOM_STEP_MS = 175L
     }
 }

@@ -25,6 +25,10 @@ object C12Protocol {
         return if (speed == 0) stop() else encode("#TPUG2wGSP" + String.format(Locale.US, "%02X", speed and 0xFF))
     }
 
+    /** One zoom step; repeat while the zoom control is held (taken from the earlier app version, 429419c). */
+    fun zoomIn() = encode("#TPUD2wDZM0A")
+    fun zoomOut() = encode("#TPUD2wDZM0B")
+
     /** Absolute pitch -90..10 degrees, speed 1..30. */
     fun pitchAbsolute(degrees: Int, speed: Int): String {
         require(degrees in -90..10) { "pitch outside -90..10 degrees" }
