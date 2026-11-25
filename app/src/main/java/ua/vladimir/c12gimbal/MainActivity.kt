@@ -102,6 +102,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     private lateinit var toggleButton: Button
     private lateinit var centerButton: Button
     private lateinit var downButton: Button
+    private lateinit var filterButton: Button
     private lateinit var pitchBar: android.widget.ProgressBar
     private lateinit var pitchLabel: TextView
     private lateinit var zoomBar: android.widget.ProgressBar
@@ -171,9 +172,11 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         overlayButton = bigButton("Дозволити кнопку поверх усіх додатків", COLOR_BUTTON) {
             startActivity(Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName")))
         }.apply { textSize = 15f }
+        filterButton = bigButton("◐  Фільтр", COLOR_BUTTON) { gimbal?.cycleFilter() }
         val quickRow = LinearLayout(this).apply {
             addView(spaced(centerButton, 0, 1f, height = dp(64)))
             addView(spaced(downButton, 0, 1f, height = dp(64)).apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(10) })
+            addView(spaced(filterButton, 0, 1f, height = dp(64)).apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(10) })
         }
 
         pitchBar = bar()
@@ -185,7 +188,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
         val legend = card(
             label("Керування з пульта", 15f, COLOR_TEXT, bold = true),
-            spaced(label("Колесо CH6 — нахил камери\nКолесо CH7 — зум\nКнопка CH12 — центр\nКнопка CH13 — вниз 90°", 14f, COLOR_MUTED), 6),
+            spaced(label("Колесо CH6 — нахил камери\nКолесо CH7 — зум\nКнопка CH12 — центр\nКнопка CH13 — вниз 90°\nКнопка R1 (CH14) — фільтр (по колу)", 14f, COLOR_MUTED), 6),
             spaced(label("Плаваюча кнопка C12", 15f, COLOR_TEXT, bold = true), 14),
             spaced(label("Зелена — керування працює, червона — вимкнене\nДотик — увімкнути/вимкнути керування\nПеретягування — перемістити\nУтримання — відкрити застосунок\nЗакрити повністю — «Закрити» у сповіщенні", 14f, COLOR_MUTED), 6),
         )
@@ -328,7 +331,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         // Colour shows the state (green = controlling, red = off), the text says what a tap does.
         toggleButton.text = if (active) "●  Керування працює — вимкнути" else "○  Керування вимкнено — увімкнути"
         toggleButton.background = rounded(if (active) COLOR_OK else COLOR_STOP)
-        listOf(centerButton, downButton).forEach {
+        listOf(centerButton, downButton, filterButton).forEach {
             it.isEnabled = active
             it.alpha = if (active) 1f else 0.4f
         }

@@ -60,6 +60,7 @@ class GimbalService : Service() {
     val controlActive: Boolean get() = c12 != null
     private var lastPitchSpeed = 0
     private var zoomDirection = 0
+    private var paletteIndex = 0
     private val buttonPressed = HashMap<String, Boolean>()
 
     private var overlay: TextView? = null
@@ -157,6 +158,14 @@ class GimbalService : Service() {
         if (c12 == null) return
         lastPitchSpeed = 0
         sendC12(command, what)
+    }
+
+    /** Switch the thermal palette to the next one in the cycle (CH14 button or the on-screen button). */
+    fun cycleFilter() {
+        if (c12 == null) return
+        val (code, name) = C12Protocol.PALETTES[paletteIndex]
+        paletteIndex = (paletteIndex + 1) % C12Protocol.PALETTES.size
+        sendC12(C12Protocol.palette(code), "фільтр: $name")
     }
 
     fun showOverlay() {
@@ -411,7 +420,7 @@ class GimbalService : Service() {
         if (!rcBound) startRcProbe()
         applyBroadcastMode()
         handler.postDelayed(watchdogTask, WATCHDOG_INTERVAL_MS)
-        log("CONTROLLER увімкнено: $CH_PITCH=нахил, $CH_CENTER=центр, $CH_DOWN90=вниз 90°, $CH_ZOOM=зум")
+        log("CONTROLLER увімкнено: $CH_PITCH=нахил, $CH_CENTER=центр, $CH_DOWN90=вниз 90°, $CH_ZOOM=зум, $CH_FILTER=фільтр")
     }
 
     private fun stopController() {
@@ -448,6 +457,7 @@ class GimbalService : Service() {
             lastPitchSpeed = 0
             sendC12(C12Protocol.pitchAbsolute(-90, DOWN90_SPEED), "вниз 90°")
         }
+        if (risingEdge(ch, CH_FILTER)) cycleFilter()
         ch[CH_ZOOM]?.let { value ->
             val direction = wheelToSpeed(value, 1)
             if (direction != zoomDirection) {
@@ -535,6 +545,7 @@ class GimbalService : Service() {
         const val CH_ZOOM = "CHANNEL_7"
         const val CH_CENTER = "CHANNEL_12"
         const val CH_DOWN90 = "CHANNEL_13"
+        const val CH_FILTER = "CHANNEL_14"
         const val WHEEL_CENTER = 1500
         const val WHEEL_SPAN = 450
         const val WHEEL_DEADZONE = 45

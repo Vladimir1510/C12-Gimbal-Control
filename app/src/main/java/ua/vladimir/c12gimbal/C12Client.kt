@@ -29,6 +29,27 @@ object C12Protocol {
     fun zoomIn() = encode("#TPUD2wDZM0A")
     fun zoomOut() = encode("#TPUD2wDZM0B")
 
+    /**
+     * Thermal pseudo-colour palettes (IMG command), in cycle order. Codes from the C12 rcsdk
+     * (value 02 is unused); each press of the filter button advances to the next one.
+     */
+    val PALETTES = listOf(
+        "01" to "біла гаряча",
+        "03" to "сепія",
+        "04" to "залізо",
+        "05" to "райдуга",
+        "06" to "ніч",
+        "07" to "аврора",
+        "08" to "червона гаряча",
+        "09" to "джунглі",
+        "0A" to "медична",
+        "0B" to "чорна гаряча",
+        "0C" to "сяйво",
+    )
+
+    /** Set thermal palette by its code (see [PALETTES]); e.g. palette("01") -> "#TPUD2wIMG0147". */
+    fun palette(code: String) = encode("#TPUD2wIMG$code")
+
     /** Absolute pitch -90..10 degrees, speed 1..30. */
     fun pitchAbsolute(degrees: Int, speed: Int): String {
         require(degrees in -90..10) { "pitch outside -90..10 degrees" }
